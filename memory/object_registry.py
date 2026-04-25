@@ -91,6 +91,7 @@ class ObjectRegistry:
             "kp_num": len(features.get("kp", [])) if features.get("kp") else 0,
             "img": features.get("img"),
             "img_shape": image_shape,
+            "hsv_profile": features.get("hsv_profile"),
             "registration_time": datetime.now().isoformat(),
             "metadata": metadata or {}
         }

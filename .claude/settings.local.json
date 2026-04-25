@@ -1,9 +1,0 @@
-{
-  "permissions": {
-    "allow": [
-      "Bash(D:/final_4c/.venv/Scripts/pip list:*)",
-      "Bash(D:/final_4c/.venv/Scripts/pip.exe list:*)",
-      "WebSearch"
-    ]
-  }
-}
