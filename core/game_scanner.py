@@ -19,6 +19,8 @@ from projector.projector_controller import ProjectorController
 from metrics.metrics_tracker import MetricsTracker
 from metrics.profiler import Profiler
 from config import settings
+from game.turn_manager import TurnManager
+from game.field_calibration import FieldCalibration
 
 
 class GameScanner:
@@ -62,6 +64,17 @@ class GameScanner:
 
         # Отложенная регистрация: callback → основной цикл (избегает реентрантного waitKey)
         self._pending_registration: tuple | None = None  # (roi_image, name, roi_coords)
+        self._pending_background_name: str | None = None  # имя объекта для background-регистрации
+
+        # Очередь ходов
+        self.turns = TurnManager()
+        self._pending_player_name: str | None = None  # буфер между двумя шагами ввода игрока
+
+        # Калибровка поля
+        self.field = FieldCalibration()
+        self._calibration_mode: bool = False
+        self._calibration_corners: list[tuple[int, int]] = []
+        self._grid_visible: bool = True  # видимость сетки
 
         # Флаги
         self.running = False
@@ -70,6 +83,12 @@ class GameScanner:
         """Вывод с временной меткой — попадает в stdout → scanner.log."""
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] {msg}")
+
+    @staticmethod
+    def _putText_stroked(frame, text, pos, font, font_scale, color, thickness=1):
+        """Draw text with dark stroke for visibility on variable background."""
+        cv2.putText(frame, text, pos, font, font_scale, (0, 0, 0), thickness + 2, cv2.LINE_AA)
+        cv2.putText(frame, text, pos, font, font_scale, color, thickness, cv2.LINE_AA)
 
 
     def _mouse_callback(self, event, x, y, flags, param):
@@ -93,8 +112,19 @@ class GameScanner:
             print("❌ Ввод отменён.")
             return
 
-        # Клики по кнопкам управления (вне режима регистрации)
-        if not self.registration_mode and event == cv2.EVENT_LBUTTONDOWN:
+        # Сбор угловых точек в режиме калибровки
+        if self._calibration_mode and event == cv2.EVENT_LBUTTONDOWN:
+            self._calibration_corners.append((x, y))
+            print(f"  Угол {len(self._calibration_corners)}/4: ({x}, {y})")
+            if len(self._calibration_corners) == 4:
+                self._calibration_mode = False
+                self._text_input_mode = "field_grid"
+                self._text_input_buffer = ""
+                print("  Введите размер сетки: ширина x высота (например, 8x5):")
+            return
+
+        # Клики по кнопкам управления (вне режима регистрации и калибровки)
+        if not self.registration_mode and not self._calibration_mode and event == cv2.EVENT_LBUTTONDOWN:
             for btn in self._button_rects:
                 x1, y1, x2, y2 = btn["rect"]
                 if x1 <= x <= x2 and y1 <= y <= y2:
@@ -216,8 +246,8 @@ class GameScanner:
             ret, preview = self.camera.read_frame()
             if ret:
                 hint = f"Shot {shot_num}/{total}: tilt ~10 deg | any key = capture | ESC = stop"
-                cv2.putText(preview, hint, (20, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+                self._putText_stroked(preview, hint, (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 if self._display_scale != 1.0:
                     dw = int(preview.shape[1] * self._display_scale)
                     dh = int(preview.shape[0] * self._display_scale)
@@ -250,8 +280,8 @@ class GameScanner:
             while state['pt'] is None:
                 ret, preview = self.camera.read_frame()
                 if ret:
-                    cv2.putText(preview, hint, (20, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+                    self._putText_stroked(preview, hint, (20, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                     if self._display_scale != 1.0:
                         dw = int(preview.shape[1] * self._display_scale)
                         dh = int(preview.shape[0] * self._display_scale)
@@ -297,8 +327,8 @@ class GameScanner:
                 preview = frame.copy()
                 if state['start'] and state['cur']:
                     cv2.rectangle(preview, state['start'], state['cur'], (0, 255, 255), 2)
-                cv2.putText(preview, hint, (20, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+                self._putText_stroked(preview, hint, (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                 if self._display_scale != 1.0:
                     dw = int(preview.shape[1] * self._display_scale)
                     dh = int(preview.shape[0] * self._display_scale)
@@ -326,21 +356,14 @@ class GameScanner:
         """
         Режим 'background': захват N снимков с автовыделением через вычитание фона.
         Объект размещается в разных точках поля — без наклона, без клика на пиксель.
-
-        ИНТЕГРАЦИЯ (TODO): вызывается вместо ROI-регистрации.
-        Требует нового флага _pending_background в tracking_loop:
-          - start_registration(): если REGISTRATION_MODE == 'background',
-            установить _pending_background = name (не registration_mode = True)
-          - tracking_loop(): обработать _pending_background → вызвать этот метод,
-            передать результат напрямую в _register_object_from_roi(shots[0], name, None)
-            с предварительным вызовом self.feature_extractor на каждый shot.
+        Активируется через REGISTRATION_MODE = 'background' в settings.py.
         """
         print(f"[background] Уберите все объекты с поля, нажмите любую клавишу...")
         while True:
             ret, preview = self.camera.read_frame()
             if ret:
-                cv2.putText(preview, "Remove all objects, press any key", (20, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2, cv2.LINE_AA)
+                self._putText_stroked(preview, "Remove all objects, press any key", (20, 50),
+                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2)
                 if self._display_scale != 1.0:
                     dw = int(preview.shape[1] * self._display_scale)
                     dh = int(preview.shape[0] * self._display_scale)
@@ -363,8 +386,8 @@ class GameScanner:
                 ret, preview = self.camera.read_frame()
                 if ret:
                     hint = f"Shot {i + 1}/{n}: place '{name}' at new position | any key | ESC=stop"
-                    cv2.putText(preview, hint, (20, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2, cv2.LINE_AA)
+                    self._putText_stroked(preview, hint, (20, 50),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                     if self._display_scale != 1.0:
                         dw = int(preview.shape[1] * self._display_scale)
                         dh = int(preview.shape[0] * self._display_scale)
@@ -398,13 +421,17 @@ class GameScanner:
 
         return shots
 
-    def _register_object_from_roi(self, roi_image: np.ndarray, name: str, roi_coords: tuple = None):
+    def _register_object_from_roi(self, roi_image: np.ndarray, name: str,
+                                   roi_coords: tuple = None, pre_shots: list = None):
         """Регистрация объекта из области интереса (один или несколько снимков)."""
-        shots = (
-            self._capture_shots(roi_image, roi_coords)
-            if roi_coords and settings.REGISTRATION_SHOTS > 1
-            else [roi_image]
-        )
+        if pre_shots is not None:
+            shots = pre_shots
+        else:
+            shots = (
+                self._capture_shots(roi_image, roi_coords)
+                if roi_coords and settings.REGISTRATION_SHOTS > 1
+                else [roi_image]
+            )
 
         per_shot = max(settings.MIN_REGISTRATION_KEYPOINTS,
                        settings.REGISTRATION_FEATURES_PER_SHOT)
@@ -453,7 +480,6 @@ class GameScanner:
         """Вычислить позиции кнопок управления для текущего размера кадра."""
         buttons = [
             {"label": "[R] Register", "key": ord("r")},
-            {"label": "[L] List",     "key": ord("l")},
             {"label": "[D] Delete",   "key": ord("d")},
             {"label": "[I] Images",   "key": ord("i")},
             {"label": "[Q] Quit",     "key": ord("q")},
@@ -472,28 +498,33 @@ class GameScanner:
         h, w = frame.shape[:2]
 
         # Полупрозрачный блок с инструкциями (правый верхний угол)
-        lines = ["Controls:", "[R] Register", "[L] List", "[D] Delete", "[I] Images", "[Q] Quit"]
-        box_w, box_h = 160, len(lines) * 20 + 10
+        lines = ["Controls:", "[R] Register", "[L] List", "[D] Delete", "[I] Images",
+                 "[T] Add player", "[N] Next turn", "[A] All chips",
+                 "[C] Cal/Clear field", "[G] Toggle grid", "[Q] Quit"]
+        box_w, box_h = 185, len(lines) * 20 + 10
         overlay = frame.copy()
         cv2.rectangle(overlay, (w - box_w - 5, 5), (w - 5, box_h + 5), (0, 0, 0), -1)
         cv2.addWeighted(overlay, 0.55, frame, 0.45, 0, frame)
         for i, txt in enumerate(lines):
             color = (200, 200, 200) if i > 0 else (120, 255, 120)
-            cv2.putText(frame, txt, (w - box_w, 22 + i * 20),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1, cv2.LINE_AA)
+            self._putText_stroked(frame, txt, (w - box_w, 22 + i * 20),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, color, 1)
 
         # Текстовый ввод в оверлее
         if self._text_input_mode is not None:
-            prompt = "Name (Enter/ESC/click):" if self._text_input_mode == "register" \
-                     else "Num or name (Enter/ESC/click):"
+            prompt = ("Name (Enter/ESC/click):"        if self._text_input_mode == "register"
+                      else "Num or name (Enter/ESC/click):" if self._text_input_mode == "delete_select"
+                      else "Player name (Enter/ESC):"       if self._text_input_mode == "turn_player"
+                      else "Chip num/name (Enter/ESC):"     if self._text_input_mode == "turn_chip"
+                      else "Grid cols x rows, e.g. 8x5 (Enter/ESC):")
             display_text = f"{prompt} {self._text_input_buffer}_"
             (tw, th), _ = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
             bx1, by1 = w // 2 - tw // 2 - 12, h // 2 - th - 12
             bx2, by2 = w // 2 + tw // 2 + 12, h // 2 + 12
             cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 0, 0), -1)
             cv2.rectangle(frame, (bx1, by1), (bx2, by2), (0, 200, 200), 1)
-            cv2.putText(frame, display_text, (bx1 + 12, h // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2, cv2.LINE_AA)
+            self._putText_stroked(frame, display_text, (bx1 + 12, h // 2),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 255), 2)
 
         # Кнопки внизу кадра
         btn_colors = [(40, 100, 40), (40, 40, 100), (80, 40, 100), (40, 80, 100), (100, 40, 40)]
@@ -503,21 +534,19 @@ class GameScanner:
             cv2.rectangle(frame, (x1, y1), (x2, y2), color, -1)
             cv2.rectangle(frame, (x1, y1), (x2, y2), (180, 180, 180), 1)
             (tw, th), _ = cv2.getTextSize(btn["label"], cv2.FONT_HERSHEY_SIMPLEX, 0.45, 1)
-            cv2.putText(frame, btn["label"],
+            self._putText_stroked(frame, btn["label"],
                         (x1 + (x2 - x1 - tw) // 2, y1 + (y2 - y1 + th) // 2),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1, cv2.LINE_AA)
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
     def start_registration(self, name: str):
-        """
-        Начало режима регистрации нового объекта
-        
-        Args:
-            name: Имя для нового объекта
-        """
-        self.registration_name = name
-        self.registration_mode = True
-        self.mouse_handler_params[2] = name
-        self._log(f"РЕЖИМ РЕГИСТРАЦИИ: '{name}' — выделите объект мышью")
+        if settings.REGISTRATION_MODE == 'background':
+            self._pending_background_name = name
+            self._log(f"РЕЖИМ РЕГИСТРАЦИИ (background): '{name}'")
+        else:
+            self.registration_name = name
+            self.registration_mode = True
+            self.mouse_handler_params[2] = name
+            self._log(f"РЕЖИМ РЕГИСТРАЦИИ: '{name}' — выделите объект мышью")
     
     def _show_thumbnails(self) -> None:
         """Показать окно с миниатюрами всех зарегистрированных объектов"""
@@ -546,11 +575,11 @@ class GameScanner:
                 canvas[y:y + thumb, x:x + thumb] = cv2.resize(img, (thumb, thumb))
             else:
                 cv2.rectangle(canvas, (x, y), (x + thumb, y + thumb), (50, 50, 50), -1)
-                cv2.putText(canvas, "no img", (x + 30, y + thumb // 2),
+                self._putText_stroked(canvas, "no img", (x + 30, y + thumb // 2),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.45, (120, 120, 120), 1)
 
-            cv2.putText(canvas, meta["name"][:20], (x, y + thumb + label_h - 4),
-                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1, cv2.LINE_AA)
+            self._putText_stroked(canvas, meta["name"][:20], (x, y + thumb + label_h - 4),
+                        cv2.FONT_HERSHEY_SIMPLEX, 0.45, (200, 200, 200), 1)
 
         cv2.imshow("Registered Objects", canvas)
         # Опрашиваем с таймаутом — ловим и клавишу, и закрытие крестиком
@@ -586,6 +615,14 @@ class GameScanner:
                 self._text_input_buffer = self._text_input_buffer[:-1]
             elif 32 <= key < 127:
                 self._text_input_buffer += chr(key)
+            return False
+
+        # Режим калибровки — только ESC для отмены
+        if self._calibration_mode:
+            if key == 27:
+                self._calibration_mode = False
+                self._calibration_corners = []
+                print("❌ Калибровка отменена.")
             return False
 
         # Режим выделения ROI — только ESC для отмены
@@ -627,6 +664,31 @@ class GameScanner:
         elif key == ord('i'):
             self._show_thumbnails()
             self._pending_key = None  # игнорировать клики, накопленные во время просмотра
+        elif key == ord('t'):
+            self._text_input_mode = "turn_player"
+            self._text_input_buffer = ""
+        elif key == ord('n'):
+            entry = self.turns.advance()
+            if entry:
+                self._log(f"ХОД: '{entry['player']}' → фишка '{entry['chip_name']}'")
+            else:
+                print("⚠️ Очередь пуста. Добавьте игроков через [T].")
+        elif key == ord('a'):
+            self.turns.unfocus()
+            self._log("Режим: все фишки")
+        elif key == ord('c'):
+            if self.field.is_calibrated():
+                self.field = FieldCalibration()
+                self._grid_visible = True
+                self._log("✓ Калибровка удалена. Готово к новой калибровке.")
+            else:
+                self._calibration_mode = True
+                self._calibration_corners = []
+                self._log("CALIBRATION: click 4 corners in order (Top-Left → Top-Right → Bottom-Right → Bottom-Left)")
+        elif key == ord('g'):
+            self._grid_visible = not self._grid_visible
+            state = "видна" if self._grid_visible else "скрыта"
+            self._log(f"Сетка: {state}")
         return False
 
     def _handle_text_input_confirm(self) -> None:
@@ -666,6 +728,61 @@ class GameScanner:
             if not deleted and value:
                 print(f"❌ Фишка '{value}' не найдена.")
 
+        elif mode == "turn_player":
+            if not value:
+                print("❌ Имя игрока не может быть пустым.")
+                return
+            objects = self.registry.list_objects()
+            if not objects:
+                print("❌ Нет зарегистрированных фишек.")
+                return
+            self._pending_player_name = value
+            self._delete_list = objects
+            print("\n🎮 Выберите фишку для игрока:")
+            for i, obj in enumerate(objects, 1):
+                print(f"  {i}. {obj['name']}")
+            self._text_input_mode = "turn_chip"
+            self._text_input_buffer = ""
+
+        elif mode == "turn_chip":
+            player_name = self._pending_player_name or ""
+            self._pending_player_name = None
+            if not value:
+                return
+            chip = None
+            try:
+                idx = int(value) - 1
+                if 0 <= idx < len(self._delete_list):
+                    chip = self._delete_list[idx]
+            except ValueError:
+                for obj in self._delete_list:
+                    if obj["name"] == value:
+                        chip = obj
+                        break
+            if chip:
+                self.turns.add(player_name, chip["id"], chip["name"])
+                self._log(f"ОЧЕРЕДЬ: игрок '{player_name}' → фишка '{chip['name']}'")
+            else:
+                print(f"❌ Фишка '{value}' не найдена.")
+
+        elif mode == "field_grid":
+            import re
+            parts = re.split(r'[xхX×,\s]+', value.strip())
+            if len(parts) == 2:
+                try:
+                    cols, rows = int(parts[0]), int(parts[1])
+                    if cols > 0 and rows > 0 and len(self._calibration_corners) == 4:
+                        self.field.set_corners(self._calibration_corners, cols, rows)
+                        self.field.save("items/field_calibration.json")
+                        self._log(f"ПОЛЕ: {cols}×{rows} клеток, сохранено")
+                    else:
+                        print("❌ Некорректный размер или нет угловых точек.")
+                except ValueError:
+                    print(f"❌ Не могу разобрать '{value}', ожидается 'ШxВ' (например, 8x5).")
+            else:
+                print(f"❌ Ожидается 'ШxВ' (например, 8x5), получено: '{value}'.")
+            self._calibration_corners = []
+
     def tracking_loop(self):
         """Главный цикл трекинга и обработки кадров"""
         # Инициализация камеры
@@ -674,12 +791,20 @@ class GameScanner:
             self._log("ОШИБКА: не удалось инициализировать камеру")
             return
         
+        # Загрузка калибровки поля (если есть)
+        field_info = ""
+        if self.field.load("items/field_calibration.json"):
+            field_info = f" | field: {self.field.grid_cols}x{self.field.grid_rows}"
+
+        self._log(f"SESSION START - detector: {settings.DETECTOR_TYPE}, SIFT: {settings.SIFT_FEATURES}{field_info}")
+
         # Создание окна и привязка обработчика мыши
         cv2.namedWindow(settings.WINDOW_NAME)
         cv2.setMouseCallback(settings.WINDOW_NAME, self._mouse_callback, self.mouse_handler_params)
         
         self.running = True
         frame_count = 0
+        start_time = datetime.datetime.now()
 
         while self.running:
             proc_start = self.metrics.tick()
@@ -701,6 +826,15 @@ class GameScanner:
                 self._pending_registration = None
                 self._register_object_from_roi(roi_image, name, roi_coords)
 
+            if self._pending_background_name is not None:
+                name = self._pending_background_name
+                self._pending_background_name = None
+                shots = self._capture_background_shots(name, settings.REGISTRATION_SHOTS)
+                if shots:
+                    self._register_object_from_roi(shots[0], name, pre_shots=shots)
+                else:
+                    self._log(f"ОТМЕНА регистрации '{name}': нет снимков")
+
 
             # Извлечение признаков из текущего кадра
             with (p.measure('extract') if p else nullcontext()):
@@ -708,12 +842,19 @@ class GameScanner:
 
             # Визуализация
             display_frame = frame.copy()
+            if self._grid_visible:
+                self.field.draw_grid(display_frame)
 
             if des_frame is not None and len(des_frame) > 0:
                 # Получение всех зарегистрированных объектов
                 registered_objects = self.registry.get_all_for_detection()
 
                 if registered_objects:
+                    # Фокусированная детекция: только фишка текущего игрока
+                    active_id = self.turns.active_chip_id
+                    if active_id and active_id in registered_objects:
+                        registered_objects = {active_id: registered_objects[active_id]}
+
                     # Детекция объектов
                     with (p.measure('detect') if p else nullcontext()):
                         detections = self.object_detector.detect_objects(
@@ -730,11 +871,27 @@ class GameScanner:
                     # Логирование изменений через трекер (дебаунс 30 кадров — без шума)
                     for d in detections:
                         self._active_names[d["object_id"]] = d["object_name"]
+
+                    # Сборка карты клеток для логирования
+                    cell_map = {}  # object_id → (cell_number, row+1, col+1)
+                    for det in detections:
+                        cell_pos = self.field.pixel_to_cell(det["center"][0], det["center"][1])
+                        cell_num = self.field.pixel_to_cell_number(det["center"][0], det["center"][1])
+                        if cell_num and cell_pos:
+                            row, col = cell_pos
+                            cell_map[det["object_id"]] = (cell_num, row+1, col+1)
+
                     tracker_ids = {o.object_id for o in self.tracker.get_active_objects()}
                     for oid in tracker_ids - self._prev_active_ids:
-                        self._log(f"ПОЯВИЛАСЬ: '{self._active_names.get(oid, oid[:8])}'")
+                        name = self._active_names.get(oid, oid[:8])
+                        if oid in cell_map:
+                            cell_num, row, col = cell_map[oid]
+                            cell_info = f" at cell {cell_num} ({row},{col})"
+                        else:
+                            cell_info = " (outside field)"
+                        self._log(f"APPEARED: '{name}'{cell_info}")
                     for oid in self._prev_active_ids - tracker_ids:
-                        self._log(f"ПРОПАЛА:   '{self._active_names.get(oid, oid[:8])}'")
+                        self._log(f"DISAPPEARED: '{self._active_names.get(oid, oid[:8])}'")
                     self._prev_active_ids = tracker_ids
                     
                     # Визуализация детекций
@@ -765,8 +922,15 @@ class GameScanner:
                         cv2.polylines(display_frame, [smooth_corners], True, (0, 255, 0), 2, cv2.LINE_AA)
                         cv2.circle(display_frame, smooth_center, 5, (0, 0, 255), -1)
 
-                        label = f"{object_name} ({confidence:.2f}, {matches_count})"
-                        cv2.putText(
+                        cell_num = self.field.pixel_to_cell_number(smooth_center[0], smooth_center[1])
+                        cell_pos = self.field.pixel_to_cell(smooth_center[0], smooth_center[1])
+                        if cell_num and cell_pos:
+                            row, col = cell_pos
+                            cell_str = f" [cell {cell_num} ({row+1},{col+1})]"
+                        else:
+                            cell_str = ""
+                        label = f"{object_name}{cell_str} ({confidence:.2f}, {matches_count})"
+                        self._putText_stroked(
                             display_frame, label,
                             (smooth_corners[0][0][0], smooth_corners[0][0][1] - 10),
                             cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2
@@ -775,13 +939,43 @@ class GameScanner:
                         # Вывод в консоль (опционально, можно отключить для производительности)
                         # print(f"Объект '{object_name}' (ID: {object_id[:8]}...) найден! Центр: {center}, Уверенность: {confidence:.2f}")
             
+            # Стартовое сообщение (первые 5 секунд, только когда нет активного хода)
+            if ((datetime.datetime.now() - start_time).total_seconds() < 5.0
+                    and not self.turns.is_focused()
+                    and not self._calibration_mode
+                    and not self.registration_mode):
+                self._putText_stroked(display_frame, "Mode: all chips",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (90, 180, 180), 2)
+
+            # Информация о режиме калибровки
+            if self._calibration_mode:
+                n = len(self._calibration_corners)
+                labels_short = ["TL", "TR", "BR", "BL"]
+                labels_full = ["Top-Left", "Top-Right", "Bottom-Right", "Bottom-Left"]
+                self._putText_stroked(display_frame,
+                            f"CALIBRATION: click corner {n+1}/4 ({labels_full[n]})",
+                            (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (255, 200, 0), 2)
+                for i, pt in enumerate(self._calibration_corners):
+                    cv2.circle(display_frame, pt, 8, (255, 200, 0), -1)
+                    self._putText_stroked(display_frame, labels_short[i], (pt[0] + 10, pt[1] - 6),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
+
+            # Информация о текущем ходе
+            turn_entry = self.turns.current()
+            if turn_entry:
+                self._putText_stroked(
+                    display_frame,
+                    f"TURN: {turn_entry['player']}  [{turn_entry['chip_name']}]",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2
+                )
+
             # Информация о режиме регистрации
             if self.registration_mode:
-                cv2.putText(
+                self._putText_stroked(
                     display_frame, f"REGISTRATION MODE: {self.registration_name}",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.7, (0, 255, 255), 2
                 )
-                cv2.putText(
+                self._putText_stroked(
                     display_frame, "Click+drag to select  ESC=cancel",
                     (10, 60), cv2.FONT_HERSHEY_SIMPLEX, 0.5, (0, 255, 255), 1
                 )
@@ -816,13 +1010,13 @@ class GameScanner:
             if self._handle_key(key):
                 break
         
-        # Очистка
+        # Очистка (финальный лог в shutdown())
         self.camera.release()
         cv2.destroyAllWindows()
-        self._log("СТОП системы")
     
     def shutdown(self):
         """Корректное завершение работы системы"""
+        self._log("SESSION END")
         self.running = False
         self.camera.release()
         self.registry.save()

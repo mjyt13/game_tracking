@@ -30,7 +30,7 @@ DETECTOR_TYPE = 'sift'
 FEATURE_MEMORY_FILE = f'items/game_features_{DETECTOR_TYPE}.pkl'
 
 # Настройки SIFT
-SIFT_FEATURES = 500         # Максимальное количество признаков для извлечения
+SIFT_FEATURES = 10000        # Максимальное количество признаков для извлечения
 
 # Настройки AKAZE (используются только при DETECTOR_TYPE = 'akaze')
 AKAZE_THRESHOLD = 0.001     # Порог детектора; ниже → больше признаков, медленнее
@@ -62,7 +62,7 @@ REGISTRATION_SHOTS = 5           # Снимков на одну регистра
 REGISTRATION_FEATURES_PER_SHOT = 150  # Признаков, сохраняемых с каждого снимка (топ по response).
                                       # Итого: SHOTS × PER_SHOT ≈ 750 при 5 снимках.
                                       # Больше → лучше покрытие ракурсов, медленнее детекция.
-REGISTRATION_MODE = 'drag'            # Режим захвата снимков:
+REGISTRATION_MODE = 'background'            # Режим захвата снимков:
                                       #   'tilt'       — ROI фиксирован, наклонять объект вручную
                                       #   'click'      — кликнуть на объект; кроп roi_w×roi_h вокруг клика
                                       #   'drag'       — drag-выделение заново для каждого снимка
