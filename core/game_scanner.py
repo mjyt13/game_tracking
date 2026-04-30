@@ -21,6 +21,8 @@ from metrics.profiler import Profiler
 from config import settings
 from game.turn_manager import TurnManager
 from game.field_calibration import FieldCalibration
+from game.game_engine import GameEngine
+from game.events import Player
 
 
 class GameScanner:
@@ -75,6 +77,10 @@ class GameScanner:
         self._calibration_mode: bool = False
         self._calibration_corners: list[tuple[int, int]] = []
         self._grid_visible: bool = True  # видимость сетки
+
+        # Игровой движок
+        self.engine = GameEngine()
+        self._chip_cells: dict[str, int] = {}  # chip_id → последняя известная клетка
 
         # Флаги
         self.running = False
@@ -482,6 +488,7 @@ class GameScanner:
             {"label": "[R] Register", "key": ord("r")},
             {"label": "[D] Delete",   "key": ord("d")},
             {"label": "[I] Images",   "key": ord("i")},
+            {"label": "[S] Start",    "key": ord("s")},
             {"label": "[Q] Quit",     "key": ord("q")},
         ]
         margin = 8
@@ -499,7 +506,8 @@ class GameScanner:
 
         # Полупрозрачный блок с инструкциями (правый верхний угол)
         lines = ["Controls:", "[R] Register", "[L] List", "[D] Delete", "[I] Images",
-                 "[T] Add player", "[N] Next turn", "[A] All chips",
+                 "[T] Add player", "[X] Remove player", "[S] Start game",
+                 "[N] Next turn", "[A] All chips",
                  "[C] Cal/Clear field", "[G] Toggle grid", "[Q] Quit"]
         box_w, box_h = 185, len(lines) * 20 + 10
         overlay = frame.copy()
@@ -512,10 +520,11 @@ class GameScanner:
 
         # Текстовый ввод в оверлее
         if self._text_input_mode is not None:
-            prompt = ("Name (Enter/ESC/click):"        if self._text_input_mode == "register"
+            prompt = ("Name (Enter/ESC/click):"            if self._text_input_mode == "register"
                       else "Num or name (Enter/ESC/click):" if self._text_input_mode == "delete_select"
                       else "Player name (Enter/ESC):"       if self._text_input_mode == "turn_player"
                       else "Chip num/name (Enter/ESC):"     if self._text_input_mode == "turn_chip"
+                      else "Remove player num/name (Enter/ESC):" if self._text_input_mode == "remove_player"
                       else "Grid cols x rows, e.g. 8x5 (Enter/ESC):")
             display_text = f"{prompt} {self._text_input_buffer}_"
             (tw, th), _ = cv2.getTextSize(display_text, cv2.FONT_HERSHEY_SIMPLEX, 0.65, 2)
@@ -667,10 +676,39 @@ class GameScanner:
         elif key == ord('t'):
             self._text_input_mode = "turn_player"
             self._text_input_buffer = ""
+        elif key == ord('s'):
+            entries = self.turns.list_entries()
+            if not entries:
+                print("⚠️ Очередь пуста. Добавьте игроков через [T].")
+            else:
+                players = [Player(e["player"], e["chip_id"], e["chip_name"]) for e in entries]
+                board_size = (self.field.grid_cols * self.field.grid_rows
+                              if self.field.is_calibrated() else None)
+                self.engine.start_game(players, board_size=board_size)
+                self._chip_cells.clear()
+                # turns НЕ стартует здесь — первый [N] правильно начнёт с игрока 0
+        elif key == ord('x'):
+            entries = self.turns.list_entries()
+            if not entries:
+                print("⚠️ Нет игроков в очереди.")
+            else:
+                print("\n🚫 Удаление игрока из очереди:")
+                for i, e in enumerate(entries, 1):
+                    print(f"  {i}. {e['player']} ({e['chip_name']})")
+                self._delete_list = entries
+                self._text_input_mode = "remove_player"
+                self._text_input_buffer = ""
         elif key == ord('n'):
+            if self.engine.is_active and not self.engine.can_advance():
+                print("⚠️ Дождитесь выполнения хода перед передачей очереди.")
+                return False
             entry = self.turns.advance()
             if entry:
                 self._log(f"ХОД: '{entry['player']}' → фишка '{entry['chip_name']}'")
+                if self.engine.is_active:
+                    self.engine.begin_turn(entry["chip_id"])
+                    # сброс клетки активной фишки — иначе begin_turn пропустит уже известную позицию
+                    self._chip_cells.pop(entry["chip_id"], None)
             else:
                 print("⚠️ Очередь пуста. Добавьте игроков через [T].")
         elif key == ord('a'):
@@ -764,6 +802,14 @@ class GameScanner:
                 self._log(f"ОЧЕРЕДЬ: игрок '{player_name}' → фишка '{chip['name']}'")
             else:
                 print(f"❌ Фишка '{value}' не найдена.")
+
+        elif mode == "remove_player":
+            if not value:
+                return
+            if self.turns.remove(value):
+                self._log(f"ОЧЕРЕДЬ: игрок удалён ('{value}')")
+            else:
+                print(f"❌ Игрок '{value}' не найден в очереди.")
 
         elif mode == "field_grid":
             import re
@@ -927,6 +973,9 @@ class GameScanner:
                         if cell_num and cell_pos:
                             row, col = cell_pos
                             cell_str = f" [cell {cell_num} ({row+1},{col+1})]"
+                            if self.engine.is_active and cell_num != self._chip_cells.get(object_id):
+                                self._chip_cells[object_id] = cell_num
+                                self.engine.on_chip_at_cell(object_id, cell_num)
                         else:
                             cell_str = ""
                         label = f"{object_name}{cell_str} ({confidence:.2f}, {matches_count})"
@@ -960,14 +1009,26 @@ class GameScanner:
                     self._putText_stroked(display_frame, labels_short[i], (pt[0] + 10, pt[1] - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
 
-            # Информация о текущем ходе
-            turn_entry = self.turns.current()
-            if turn_entry:
+            # Победитель
+            if self.engine.state.winner:
+                self._putText_stroked(
+                    display_frame,
+                    f"GAME OVER — {self.engine.state.winner.name} wins!",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 100), 2
+                )
+            # Информация о текущем ходе + статус FSM
+            elif turn_entry := self.turns.current():
                 self._putText_stroked(
                     display_frame,
                     f"TURN: {turn_entry['player']}  [{turn_entry['chip_name']}]",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2
                 )
+                fsm = self.engine.status_msg()
+                if fsm:
+                    self._putText_stroked(
+                        display_frame, fsm[0],
+                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, fsm[1], 2
+                    )
 
             # Информация о режиме регистрации
             if self.registration_mode:
