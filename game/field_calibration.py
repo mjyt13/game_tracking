@@ -1,22 +1,26 @@
 """
 Калибровка поля: 4 угла → гомография → сетка клеток.
 Порядок углов при клике: ЛВ → ПВ → ПН → ЛН (по часовой).
+Поддерживает разные порядки обхода: linear, snake, spiral.
 """
 import json
 import os
 import cv2
 import numpy as np
+from game.path_manager import PathManager
 
 
 class FieldCalibration:
     _FIELD_DST = np.float32([[0, 0], [1, 0], [1, 1], [0, 1]])
 
-    def __init__(self):
+    def __init__(self, path_type: str = "linear"):
         self.corners: list[tuple[int, int]] = []
         self.grid_cols: int = 0
         self.grid_rows: int = 0
         self._H: np.ndarray | None = None      # pixel → field [0,1]²
         self._H_inv: np.ndarray | None = None  # field → pixel
+        self.path_manager: PathManager | None = None
+        self.path_type = path_type
 
     def is_calibrated(self) -> bool:
         return self._H is not None
@@ -29,6 +33,8 @@ class FieldCalibration:
         src = np.float32(corners)
         self._H = cv2.getPerspectiveTransform(src, self._FIELD_DST)
         self._H_inv = cv2.getPerspectiveTransform(self._FIELD_DST, src)
+        # Инициализировать менеджер пути
+        self.path_manager = PathManager(self.path_type, cols, rows)
 
     def pixel_to_cell(self, px: int, py: int) -> tuple[int, int] | None:
         """Пиксель кадра → (row, col). None если вне поля."""
@@ -43,11 +49,14 @@ class FieldCalibration:
         return int(fy * self.grid_rows), int(fx * self.grid_cols)
 
     def pixel_to_cell_number(self, px: int, py: int) -> int | None:
-        """Пиксель кадра → номер клетки (1-indexed, слева направо сверху вниз). None если вне поля."""
+        """Пиксель кадра → номер клетки (1-indexed, порядок зависит от path_type). None если вне поля."""
         cell = self.pixel_to_cell(px, py)
         if cell is None:
             return None
         row, col = cell
+        if self.path_manager:
+            return self.path_manager.position_to_cell_number(row, col)
+        # Fallback на linear
         return row * self.grid_cols + col + 1
 
     def field_to_pixel(self, fx: float, fy: float) -> tuple[int, int]:

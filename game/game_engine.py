@@ -3,6 +3,7 @@
 Состояния: IDLE → WAITING_MOVE → (AWAITING_RULE) → TURN_DONE → WAITING_MOVE ...
 """
 import datetime
+import random
 
 from game.events import (
     Player, Event,
@@ -24,6 +25,8 @@ class GameEngine:
         self.expected_cell: int = 0   # куда должна встать фишка в WAITING_MOVE
         self.rule_target: int = 0     # куда должна встать фишка в AWAITING_RULE
         self._active_chip_id: str | None = None
+        self._last_dice_roll: int = 0  # последний результат броска
+        self._pending_extra_turn: str | None = None  # chip_id игрока, получившего EXTRA_TURN
 
     def start_game(self, players: list[Player], board_size: int | None = None) -> Event:
         bs = board_size if board_size is not None else game_rules.BOARD_SIZE
@@ -36,11 +39,15 @@ class GameEngine:
         self._active_chip_id = None
         return self._emit(GAME_START, {"players": [p.name for p in players], "board_size": bs})
 
-    def begin_turn(self, chip_id: str) -> Event:
-        """Начало хода. Вызывается при [N] после TurnManager.advance()."""
+    def begin_turn(self, chip_id: str, dice_roll: int | None = None) -> Event:
+        """Начало хода. Вызывается при [N] после TurnManager.advance(). dice_roll — движение вперёд; если None, рандомный 1–6."""
+        if dice_roll is None:
+            dice_roll = random.randint(1, 6)
+        self._last_dice_roll = dice_roll
+
         player = self.state.get_player(chip_id)
         if player is None:
-            return self._emit(TURN_START, {"player": chip_id[:8]})
+            return self._emit(TURN_START, {"player": chip_id[:8], "dice_roll": dice_roll})
 
         self._active_chip_id = chip_id
 
@@ -48,14 +55,19 @@ class GameEngine:
             player.skip_turns -= 1
             self.turn_state = TURN_DONE
             return self._emit(TURN_START, {
-                "player": player.name, "skipped": True,
+                "player": player.name, "skipped": True, "dice_roll": dice_roll,
                 "skip_turns_left": player.skip_turns,
             })
 
         self.turn_state = WAITING_MOVE
-        self.expected_cell = player.cell + 1
+        self.expected_cell = player.cell + dice_roll
+
+        # Если dice_roll достаточен для финиша, ограничить expected_cell на финальную клетку
+        if self.expected_cell >= self.state.board_size:
+            self.expected_cell = self.state.board_size
+
         return self._emit(TURN_START, {
-            "player": player.name, "skipped": False,
+            "player": player.name, "skipped": False, "dice_roll": dice_roll,
             "current_cell": player.cell, "expected_cell": self.expected_cell,
         })
 
@@ -88,9 +100,15 @@ class GameEngine:
             effect = self.rules.get_effect(cell)
             if effect is None:
                 self.turn_state = TURN_DONE
-            elif effect.type in (SKIP_TURN, EXTRA_TURN):
+            elif effect.type == SKIP_TURN:
                 self.state.apply_effect(player, effect)
                 fired.append(self._emit(RULE_TRIGGERED, {"player": player.name, "cell": cell, "effect": effect.type}))
+                self.turn_state = TURN_DONE
+            elif effect.type == EXTRA_TURN:
+                self.state.apply_effect(player, effect)
+                fired.append(self._emit(RULE_TRIGGERED, {"player": player.name, "cell": cell, "effect": effect.type}))
+                # Отметить, что этому игроку нужен экстра-ход (следующий [N] даст их ещё один ход вместо смены игрока)
+                self._pending_extra_turn = chip_id
                 self.turn_state = TURN_DONE
             elif effect.type in (MOVE_FORWARD, MOVE_BACK):
                 delta = effect.distance if effect.type == MOVE_FORWARD else -effect.distance
@@ -119,7 +137,7 @@ class GameEngine:
         if not self.state.active:
             return None
         if self.turn_state == WAITING_MOVE:
-            return f"→ Move chip to cell {self.expected_cell}", (0, 220, 255)
+            return f"→ Dice: {self._last_dice_roll}, move chip to cell {self.expected_cell}", (0, 220, 255)
         if self.turn_state == AWAITING_RULE:
             return f"→ Rule: move chip to cell {self.rule_target}", (0, 140, 255)
         if self.turn_state == TURN_DONE:

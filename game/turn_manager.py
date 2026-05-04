@@ -20,8 +20,8 @@ class TurnManager:
             self._index = 0
             self._focused = False
 
-    def remove(self, value: str) -> bool:
-        """Удалить игрока по 1-based номеру в очереди или по имени. True если нашёл."""
+    def remove(self, value: str) -> str | None:
+        """Удалить игрока по 1-based номеру в очереди или по имени. Вернуть chip_id если нашёл, иначе None."""
         chip_id = None
         try:
             idx = int(value) - 1
@@ -36,8 +36,8 @@ class TurnManager:
                     break
         if chip_id:
             self.remove_by_chip(chip_id)
-            return True
-        return False
+            return chip_id
+        return None
 
     def start(self) -> dict | None:
         """Начать с первого игрока."""

@@ -4,6 +4,9 @@
 """
 from game.events import SKIP_TURN, EXTRA_TURN, MOVE_FORWARD, MOVE_BACK
 
+# Порядок обхода клеток на поле
+PATH_TYPE = "linear"  # варианты: "linear", "snake", "spiral"
+
 BOARD_SIZE = 12  # дефолт; при старте игры переопределяется как grid_cols × grid_rows поля
 
 CELL_RULES: dict[int, dict] = {
@@ -12,4 +15,6 @@ CELL_RULES: dict[int, dict] = {
     9:  {"effect": MOVE_BACK,    "distance": 3},
     2: {"effect": MOVE_FORWARD, "distance": 2},
     3:  {"effect": EXTRA_TURN},
+    4:  {"effect": EXTRA_TURN},
+    6:  {"effect": EXTRA_TURN},
 }

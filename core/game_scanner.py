@@ -7,6 +7,7 @@ import cv2
 import datetime
 import numpy as np
 from contextlib import nullcontext
+from pathlib import Path
 from typing import Optional
 
 from camera.camera_manager import CameraManager
@@ -19,10 +20,13 @@ from projector.projector_controller import ProjectorController
 from metrics.metrics_tracker import MetricsTracker
 from metrics.profiler import Profiler
 from config import settings
+from config import game_rules
 from game.turn_manager import TurnManager
 from game.field_calibration import FieldCalibration
 from game.game_engine import GameEngine
+from game.game_state_manager import GameStateManager
 from game.events import Player
+from http_server import GameEventServer
 
 
 class GameScanner:
@@ -67,13 +71,14 @@ class GameScanner:
         # Отложенная регистрация: callback → основной цикл (избегает реентрантного waitKey)
         self._pending_registration: tuple | None = None  # (roi_image, name, roi_coords)
         self._pending_background_name: str | None = None  # имя объекта для background-регистрации
+        self._pending_load_save: str | None = None  # путь сохранения для загрузки
 
         # Очередь ходов
         self.turns = TurnManager()
         self._pending_player_name: str | None = None  # буфер между двумя шагами ввода игрока
 
         # Калибровка поля
-        self.field = FieldCalibration()
+        self.field = FieldCalibration(game_rules.PATH_TYPE)
         self._calibration_mode: bool = False
         self._calibration_corners: list[tuple[int, int]] = []
         self._grid_visible: bool = True  # видимость сетки
@@ -81,6 +86,14 @@ class GameScanner:
         # Игровой движок
         self.engine = GameEngine()
         self._chip_cells: dict[str, int] = {}  # chip_id → последняя известная клетка
+        self._chip_cell_debounce: dict[str, tuple[int, int]] = {}  # chip_id → (cell, frame_count)
+
+        # Сохранение состояния игры
+        self.state_manager = GameStateManager()
+
+        # HTTP сервер для событий
+        self.http_server = GameEventServer()
+        self.http_server.start()
 
         # Флаги
         self.running = False
@@ -89,6 +102,25 @@ class GameScanner:
         """Вывод с временной меткой — попадает в stdout → scanner.log."""
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] {msg}")
+
+    def _forward_engine_event(self, event) -> None:
+        """Отправить событие GameEngine в HTTP сервер"""
+        if event:
+            self.http_server.emit_event(event.type, event.data)
+            # Обновить текущее состояние игры
+            if self.engine.state.active:
+                state = {
+                    "active": True,
+                    "turn_state": self.engine.turn_state,
+                    "expected_cell": self.engine.expected_cell,
+                    "rule_target": self.engine.rule_target,
+                    "board_size": self.engine.state.board_size,
+                    "players": [
+                        {"name": p.name, "cell": p.cell, "skip_turns": p.skip_turns}
+                        for p in self.engine.state.players
+                    ],
+                }
+                self.http_server.update_game_state(state)
 
     @staticmethod
     def _putText_stroked(frame, text, pos, font, font_scale, color, thickness=1):
@@ -684,8 +716,10 @@ class GameScanner:
                 players = [Player(e["player"], e["chip_id"], e["chip_name"]) for e in entries]
                 board_size = (self.field.grid_cols * self.field.grid_rows
                               if self.field.is_calibrated() else None)
-                self.engine.start_game(players, board_size=board_size)
+                event = self.engine.start_game(players, board_size=board_size)
+                self._forward_engine_event(event)
                 self._chip_cells.clear()
+                self._chip_cell_debounce.clear()
                 # turns НЕ стартует здесь — первый [N] правильно начнёт с игрока 0
         elif key == ord('x'):
             entries = self.turns.list_entries()
@@ -702,15 +736,30 @@ class GameScanner:
             if self.engine.is_active and not self.engine.can_advance():
                 print("⚠️ Дождитесь выполнения хода перед передачей очереди.")
                 return False
-            entry = self.turns.advance()
-            if entry:
-                self._log(f"ХОД: '{entry['player']}' → фишка '{entry['chip_name']}'")
-                if self.engine.is_active:
-                    self.engine.begin_turn(entry["chip_id"])
-                    # сброс клетки активной фишки — иначе begin_turn пропустит уже известную позицию
-                    self._chip_cells.pop(entry["chip_id"], None)
+
+            # Проверить, есть ли ожидающий EXTRA_TURN для текущего игрока
+            if self.engine._pending_extra_turn:
+                chip_id = self.engine._pending_extra_turn
+                self.engine._pending_extra_turn = None
+                self._log(f"EXTRA_TURN: игрок получает ещё один ход")
+                event = self.engine.begin_turn(chip_id)
+                self._forward_engine_event(event)
+                # сброс состояния текущего хода для экстра-хода
+                self._chip_cells.pop(chip_id, None)
+                self._chip_cell_debounce.pop(chip_id, None)
             else:
-                print("⚠️ Очередь пуста. Добавьте игроков через [T].")
+                entry = self.turns.advance()
+                if entry:
+                    self._log(f"ХОД: '{entry['player']}' → фишка '{entry['chip_name']}'")
+                    if self.engine.is_active:
+                        event = self.engine.begin_turn(entry["chip_id"])
+                        self._forward_engine_event(event)
+                        # сброс клетки активной фишки — иначе begin_turn пропустит уже известную позицию
+                        self._chip_cells.pop(entry["chip_id"], None)
+                        # сброс дебаунса — новый ход начинается с чистого листа
+                        self._chip_cell_debounce.pop(entry["chip_id"], None)
+                else:
+                    print("⚠️ Очередь пуста. Добавьте игроков через [T].")
         elif key == ord('a'):
             self.turns.unfocus()
             self._log("Режим: все фишки")
@@ -727,6 +776,25 @@ class GameScanner:
             self._grid_visible = not self._grid_visible
             state = "видна" if self._grid_visible else "скрыта"
             self._log(f"Сетка: {state}")
+        elif key == ord('u'):
+            if self.engine.is_active:
+                filepath = self.state_manager.save(self.engine, self.turns.list_entries(), self.field)
+                self._log(f"✓ Состояние сохранено: {Path(filepath).name}")
+            else:
+                print("⚠️ Игра не активна. Начните игру через [S].")
+        elif key == ord('v'):
+            saves = self.state_manager.list_saves()
+            if not saves:
+                print("⚠️ Сохранённых игр нет.")
+            else:
+                print("\n💾 Доступные сохранения:")
+                for i, save in enumerate(saves, 1):
+                    players = ", ".join(save["players"])
+                    print(f"  {i}. {save['filename']} — {save['timestamp']}")
+                    print(f"     Игроки: {players} (доска: {save['board_size']})")
+                # Загрузить первое сохранение для быстрого доступа
+                self._pending_load_save = saves[0]["path"]
+                print(f"\n💡 Для загрузки наберите в консоли: game.load_state('{saves[0]['path']}')")
         return False
 
     def _handle_text_input_confirm(self) -> None:
@@ -806,8 +874,24 @@ class GameScanner:
         elif mode == "remove_player":
             if not value:
                 return
-            if self.turns.remove(value):
+            chip_id = self.turns.remove(value)
+            if chip_id:
                 self._log(f"ОЧЕРЕДЬ: игрок удалён ('{value}')")
+                # Синхронизировать с GameEngine — удалить из состояния игры
+                if self.engine.is_active:
+                    player = self.engine.state.get_player(chip_id)
+                    if player:
+                        self.engine.state.players.remove(player)
+                        self._log(f"ENGINE: игрок '{player.name}' удалён из состояния")
+
+                    # Если удаляемый игрок — текущий активный, сбросить состояние
+                    if self.engine._active_chip_id == chip_id:
+                        self.engine._active_chip_id = None
+                        self.engine._pending_extra_turn = None
+                        # Позволить адванцировать очередь, установив TURN_DONE
+                        if self.engine.turn_state in ("WAITING_MOVE", "AWAITING_RULE"):
+                            self.engine.turn_state = "TURN_DONE"
+                        self._log(f"⚠️ Удалённый игрок был активным. Очередь готова к продвижению.")
             else:
                 print(f"❌ Игрок '{value}' не найден в очереди.")
 
@@ -974,8 +1058,22 @@ class GameScanner:
                             row, col = cell_pos
                             cell_str = f" [cell {cell_num} ({row+1},{col+1})]"
                             if self.engine.is_active and cell_num != self._chip_cells.get(object_id):
-                                self._chip_cells[object_id] = cell_num
-                                self.engine.on_chip_at_cell(object_id, cell_num)
+                                # Дебаунс: требуем 3 consecutive frames на одной клетке перед фиксацией
+                                cached_cell, cached_count = self._chip_cell_debounce.get(object_id, (None, 0))
+                                if cached_cell == cell_num:
+                                    cached_count += 1
+                                else:
+                                    cached_count = 1
+                                self._chip_cell_debounce[object_id] = (cell_num, cached_count)
+
+                                if cached_count >= 3:
+                                    # Зафиксировать движение
+                                    self._chip_cells[object_id] = cell_num
+                                    events = self.engine.on_chip_at_cell(object_id, cell_num)
+                                    for event in events:
+                                        self._forward_engine_event(event)
+                                    # Сброс дебаунса после фиксации
+                                    del self._chip_cell_debounce[object_id]
                         else:
                             cell_str = ""
                         label = f"{object_name}{cell_str} ({confidence:.2f}, {matches_count})"
@@ -1079,6 +1177,7 @@ class GameScanner:
         """Корректное завершение работы системы"""
         self._log("SESSION END")
         self.running = False
+        self.http_server.stop()
         self.camera.release()
         self.registry.save()
 
