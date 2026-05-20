@@ -19,6 +19,7 @@ class MetricsTracker:
         self.camera_mode: str = "—"
         self.registered_count: int = 0
         self.detections: list = []  # [{name, conf, matches}]
+        self.active_objects: list = []  # [{name, cell}]
 
     def tick(self) -> float:
         """Отметить начало кадра. Возвращает время старта для record_proc."""
@@ -38,6 +39,9 @@ class MetricsTracker:
             for d in detections
         ]
 
+    def update_active_objects(self, active_objects: list):
+        self.active_objects = active_objects
+
     @property
     def fps(self) -> float:
         if not self._frame_times:
@@ -53,8 +57,8 @@ class MetricsTracker:
     def render(self):
         """Отрисовать и показать окно метрик."""
         row_h = 22
-        rows = 7 + max(len(self.detections), 0)
-        panel = np.zeros((rows * row_h + 10, 300, 3), dtype=np.uint8)
+        rows = 8 + len(self.active_objects) + max(len(self.detections), 0)
+        panel = np.zeros((rows * row_h + 10, 360, 3), dtype=np.uint8)
 
         y = row_h
         def line(text, color=(200, 200, 200)):
@@ -71,6 +75,13 @@ class MetricsTracker:
         line(f"Camera:     {self.camera_mode}")
         line(f"Registered: {self.registered_count}")
         line(f"Active:     {len(self.detections)}")
+        line(f"Appeared:   {len(self.active_objects)}")
+
+        if self.active_objects:
+            line("--- appeared ---", (120, 255, 120))
+            for obj in self.active_objects:
+                cell = f"cell {obj['cell']}" if obj["cell"] else "outside"
+                line(f"  {obj['name']}: {cell}", (180, 220, 180))
 
         if self.detections:
             line("--- detections ---", (160, 160, 255))

@@ -13,12 +13,28 @@ class TurnManager:
         self._entries.append({"player": player_name, "chip_id": chip_id, "chip_name": chip_name})
 
     def remove_by_chip(self, chip_id: str) -> None:
+        removed_index = next((i for i, e in enumerate(self._entries) if e["chip_id"] == chip_id), None)
+        if removed_index is None:
+            return
+
+        was_focused = self._focused
+        was_current = was_focused and removed_index == self._index
         self._entries = [e for e in self._entries if e["chip_id"] != chip_id]
-        if self._entries:
-            self._index = self._index % len(self._entries)
-        else:
+
+        if not self._entries:
             self._index = 0
             self._focused = False
+            return
+
+        if not was_focused:
+            self._index = min(self._index, len(self._entries) - 1)
+        elif was_current:
+            # Следующий advance() должен выбрать игрока, который сдвинулся на место удалённого.
+            self._index = (removed_index - 1) % len(self._entries)
+        elif removed_index < self._index:
+            self._index -= 1
+        else:
+            self._index %= len(self._entries)
 
     def remove(self, value: str) -> str | None:
         """Удалить игрока по 1-based номеру в очереди или по имени. Вернуть chip_id если нашёл, иначе None."""

@@ -37,6 +37,10 @@ class GameEngine:
         self.state.active = True
         self.turn_state = IDLE
         self._active_chip_id = None
+        self.expected_cell = 0
+        self.rule_target = 0
+        self._last_dice_roll = 0
+        self._pending_extra_turn = None
         return self._emit(GAME_START, {"players": [p.name for p in players], "board_size": bs})
 
     def begin_turn(self, chip_id: str, dice_roll: int | None = None) -> Event:

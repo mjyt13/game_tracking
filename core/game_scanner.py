@@ -5,6 +5,7 @@
 
 import cv2
 import datetime
+import time
 import numpy as np
 from contextlib import nullcontext
 from pathlib import Path
@@ -13,6 +14,7 @@ from typing import Optional
 from camera.camera_manager import CameraManager
 from scanner.feature_extractor import FeatureExtractor
 from scanner.object_detector import ObjectDetector
+from scanner.background_subtractor import MOG2BackgroundLearner
 from memory.object_registry import ObjectRegistry
 from memory.feature_storage import FeatureStorage
 from tracker.object_tracker import ObjectTracker
@@ -40,7 +42,10 @@ class GameScanner:
         self.object_detector = ObjectDetector()
         self.storage = FeatureStorage()
         self.registry = ObjectRegistry(self.storage)
-        self.tracker = ObjectTracker()
+        self.tracker = ObjectTracker(
+            max_history=settings.TRACKER_MAX_HISTORY,
+            inactive_threshold=settings.TRACKER_INACTIVE_FRAMES,
+        )
         self.projector = ProjectorController()
         
         # Состояние регистрации
@@ -87,6 +92,7 @@ class GameScanner:
         self.engine = GameEngine()
         self._chip_cells: dict[str, int] = {}  # chip_id → последняя известная клетка
         self._chip_cell_debounce: dict[str, tuple[int, int]] = {}  # chip_id → (cell, frame_count)
+        self._turn_profile: dict | None = None
 
         # Сохранение состояния игры
         self.state_manager = GameStateManager()
@@ -103,24 +109,116 @@ class GameScanner:
         ts = datetime.datetime.now().strftime("%H:%M:%S")
         print(f"[{ts}] {msg}")
 
+    def _sync_http_game_state(self) -> None:
+        """Обновить текущее состояние игры для HTML/API."""
+        turn_entry = self.turns.current()
+        winner = self.engine.state.winner
+        state = {
+            "active": self.engine.state.active,
+            "turn_state": self.engine.turn_state,
+            "expected_cell": self.engine.expected_cell,
+            "rule_target": self.engine.rule_target,
+            "board_size": self.engine.state.board_size,
+            "winner": winner.name if winner else None,
+            "current_turn": dict(turn_entry) if turn_entry else None,
+            "ready_for_next": self.engine.is_active and self.engine.can_advance(),
+            "players": [
+                {
+                    "name": p.name,
+                    "chip_name": p.chip_name,
+                    "cell": p.cell,
+                    "skip_turns": p.skip_turns,
+                }
+                for p in self.engine.state.players
+            ],
+        }
+        self.http_server.update_game_state(state)
+
     def _forward_engine_event(self, event) -> None:
         """Отправить событие GameEngine в HTTP сервер"""
         if event:
             self.http_server.emit_event(event.type, event.data)
-            # Обновить текущее состояние игры
-            if self.engine.state.active:
-                state = {
-                    "active": True,
-                    "turn_state": self.engine.turn_state,
-                    "expected_cell": self.engine.expected_cell,
-                    "rule_target": self.engine.rule_target,
-                    "board_size": self.engine.state.board_size,
-                    "players": [
-                        {"name": p.name, "cell": p.cell, "skip_turns": p.skip_turns}
-                        for p in self.engine.state.players
-                    ],
-                }
-                self.http_server.update_game_state(state)
+            self._sync_http_game_state()
+
+    def _start_turn_profile(self, chip_id: str, player_name: str, target_cell: int, phase: str) -> None:
+        """Начать замер детекции активной фишки для текущей фазы хода."""
+        if phase not in ("WAITING_MOVE", "AWAITING_RULE"):
+            self._turn_profile = None
+            return
+        self._turn_profile = {
+            "chip_id": chip_id,
+            "player": player_name,
+            "target_cell": target_cell,
+            "phase": phase,
+            "started_perf": time.perf_counter(),
+            "started_ts": datetime.datetime.now(),
+            "first_cell_perf": None,
+            "first_cell_ts": None,
+            "first_cell": None,
+        }
+
+    def _mark_first_cell_seen(self, chip_id: str, cell: int) -> None:
+        """Зафиксировать первый кадр, где активная фишка обнаружена в целевой клетке."""
+        profile = self._turn_profile
+        if not profile or profile["chip_id"] != chip_id or profile["first_cell_ts"] is not None:
+            return
+        if cell != profile["target_cell"]:
+            return
+        profile["first_cell_perf"] = time.perf_counter()
+        profile["first_cell_ts"] = datetime.datetime.now()
+        profile["first_cell"] = cell
+        self._log(
+            f"TURN_TIMING target_cell player='{profile['player']}' phase={profile['phase']} "
+            f"cell={cell} target={profile['target_cell']} at {profile['first_cell_ts'].strftime('%H:%M:%S.%f')[:-3]}"
+        )
+
+    def _finish_turn_profile(self, chip_id: str, cell: int, accepted_state: str) -> None:
+        """Завершить замер, когда FSM приняла клетку и сменила состояние."""
+        profile = self._turn_profile
+        if not profile or profile["chip_id"] != chip_id:
+            return
+        confirmed_perf = time.perf_counter()
+        confirmed_ts = datetime.datetime.now()
+        first_perf = profile["first_cell_perf"] or confirmed_perf
+        first_ts = profile["first_cell_ts"] or confirmed_ts
+        self._log(
+            f"TURN_TIMING accepted player='{profile['player']}' phase={profile['phase']} "
+            f"cell={cell} target={profile['target_cell']} target_first={first_ts.strftime('%H:%M:%S.%f')[:-3]} "
+            f"accepted={confirmed_ts.strftime('%H:%M:%S.%f')[:-3]} delta={(confirmed_perf - first_perf):.3f}s "
+            f"state={accepted_state}->{self.engine.turn_state}"
+        )
+
+        if self.engine.turn_state == "AWAITING_RULE":
+            self._start_turn_profile(chip_id, profile["player"], self.engine.rule_target, "AWAITING_RULE")
+        else:
+            self._turn_profile = None
+
+    def _log_pre_game_summary(self) -> None:
+        """Показать сводку перед стартом, не двигая очередь ходов."""
+        entries = self.turns.list_entries()
+        if not entries:
+            self._log("ИГРА НЕ ЗАПУЩЕНА: очередь пуста. Добавьте игроков через [T], затем [S].")
+            return
+
+        if self.field.is_calibrated():
+            board_size = self.field.grid_cols * self.field.grid_rows
+            field_info = f"{self.field.grid_cols}×{self.field.grid_rows} ({board_size} клеток)"
+        else:
+            field_info = f"не откалибровано (будет BOARD_SIZE={game_rules.BOARD_SIZE})"
+
+        players = ", ".join(f"{e['player']}[{e['chip_name']}]" for e in entries)
+        rules = []
+        for cell, rule in sorted(game_rules.CELL_RULES.items()):
+            effect = rule.get("effect", "?")
+            distance = rule.get("distance")
+            suffix = f" {distance}" if distance else ""
+            rules.append(f"{cell}:{effect}{suffix}")
+        rules_info = ", ".join(rules) if rules else "нет"
+
+        self._log(
+            f"ИГРА НЕ ЗАПУЩЕНА: нажмите [S] для старта. "
+            f"Игроки: {players}. Поле: {field_info}. Путь: {game_rules.PATH_TYPE}. Правила: {rules_info}"
+        )
 
     @staticmethod
     def _putText_stroked(frame, text, pos, font, font_scale, color, thickness=1):
@@ -273,7 +371,8 @@ class GameScanner:
                 return shots
             if roi.size > 0:
                 shots.append(roi)
-                self._log(f"  снимок {i + 1} захвачен")
+                h, w = roi.shape[:2]
+                self._log(f"  снимок {i + 1} захвачен (blob {w}×{h})")
 
         return shots
 
@@ -390,18 +489,22 @@ class GameScanner:
         finally:
             cv2.setMouseCallback(settings.WINDOW_NAME, self._mouse_callback, self.mouse_handler_params)
 
-    def _capture_background_shots(self, name: str, n: int) -> list[np.ndarray]:
+    def _capture_bg_shots(self, name: str, n: int) -> list[np.ndarray]:
         """
-        Режим 'background': захват N снимков с автовыделением через вычитание фона.
-        Объект размещается в разных точках поля — без наклона, без клика на пиксель.
-        Активируется через REGISTRATION_MODE = 'background' в settings.py.
+        Unified background registration for 'background' and 'background_mog2' modes.
+        Phase 1: user clears field → press any key.
+        Phase 2: learn background (single absdiff frame or MOG2 multi-frame training with counter).
+        Phase 3: capture N object shots with auto-detection.
         """
-        print(f"[background] Уберите все объекты с поля, нажмите любую клавишу...")
+        mode = settings.REGISTRATION_MODE
+
+        # Phase 1: wait for user to clear the field
+        self._log(f"[{mode}] Уберите все объекты с поля, нажмите любую клавишу...")
         while True:
             ret, preview = self.camera.read_frame()
             if ret:
-                self._putText_stroked(preview, "Remove all objects, press any key", (20, 50),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2)
+                self._putText_stroked(preview, "Remove all objects, press any key",
+                                      (20, 50), cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 0), 2)
                 if self._display_scale != 1.0:
                     dw = int(preview.shape[1] * self._display_scale)
                     dh = int(preview.shape[0] * self._display_scale)
@@ -412,20 +515,52 @@ class GameScanner:
                 return []
             if k != 255:
                 break
-        _, bg_frame = self.camera.read_frame()
-        bg_gray = cv2.cvtColor(bg_frame, cv2.COLOR_BGR2GRAY)
+
+        # Phase 2: learn background
         k_close = np.ones((15, 15), np.uint8)
         k_open = np.ones((5, 5), np.uint8)
+        if mode == 'background':
+            _, bg_frame = self.camera.read_frame()
+            bg_gray = cv2.cvtColor(bg_frame, cv2.COLOR_BGR2GRAY)
+            mog2 = None
+        else:  # background_mog2
+            total_bg = settings.MOG2_BG_FRAMES
+            mog2 = MOG2BackgroundLearner()
+            bg_frames = []
+            while len(bg_frames) < total_bg:
+                ret, frame = self.camera.read_frame()
+                if not ret:
+                    continue
+                bg_frames.append(frame)
+                count = len(bg_frames)
+                preview = frame.copy()
+                hint = f"Wait... capturing background {count}/{total_bg}"
+                self._putText_stroked(preview, hint, (20, 50),
+                                      cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 200, 255), 2)
+                if self._display_scale != 1.0:
+                    dw = int(preview.shape[1] * self._display_scale)
+                    dh = int(preview.shape[0] * self._display_scale)
+                    preview = cv2.resize(preview, (dw, dh))
+                cv2.imshow(settings.WINDOW_NAME, preview)
+                cv2.waitKey(1)
+            mog2.train_on_frames(bg_frames)
+            self._log(f"MOG2: обучение завершено ({total_bg} кадров)")
+            bg_gray = None
 
+        # Phase 3: capture object shots
+        # while-loop (not for) so oversized blobs retry the same shot number
+        fh_max = None  # populated on first frame read
+        fw_max = None
         shots = []
-        for i in range(n):
+        i = 0
+        while i < n:
             self._log(f"  снимок {i + 1}/{n}: поместите '{name}' на новую позицию, нажмите любую клавишу (ESC=стоп)")
             while True:
                 ret, preview = self.camera.read_frame()
                 if ret:
                     hint = f"Shot {i + 1}/{n}: place '{name}' at new position | any key | ESC=stop"
                     self._putText_stroked(preview, hint, (20, 50),
-                                cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
+                                          cv2.FONT_HERSHEY_SIMPLEX, 0.8, (0, 255, 255), 2)
                     if self._display_scale != 1.0:
                         dw = int(preview.shape[1] * self._display_scale)
                         dh = int(preview.shape[0] * self._display_scale)
@@ -436,26 +571,55 @@ class GameScanner:
                     return shots
                 if k != 255:
                     break
+
             ret, frame = self.camera.read_frame()
             if not ret:
                 continue
-            gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
-            diff = cv2.absdiff(gray, bg_gray)
-            _, mask = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
-            mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
-            contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
-            if not contours:
-                self._log(f"  снимок {i + 1}: объект не найден (пустая маска)")
-                continue
-            bx, by, bw, bh = cv2.boundingRect(max(contours, key=cv2.contourArea))
-            pad = 15
-            x1 = max(0, bx - pad); y1 = max(0, by - pad)
-            x2 = min(frame.shape[1], bx + bw + pad); y2 = min(frame.shape[0], by + bh + pad)
-            roi = frame[y1:y2, x1:x2]
-            if roi.size > 0:
-                shots.append(roi.copy())
-                self._log(f"  снимок {i + 1} захвачен (blob {bw}×{bh})")
+
+            if fh_max is None:
+                fh_max = int(frame.shape[0] * settings.MOG2_MAX_BLOB_RATIO)
+                fw_max = int(frame.shape[1] * settings.MOG2_MAX_BLOB_RATIO)
+
+            if mode == 'background':
+                gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
+                diff = cv2.absdiff(gray, bg_gray)
+                _, mask = cv2.threshold(diff, 30, 255, cv2.THRESH_BINARY)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_CLOSE, k_close)
+                mask = cv2.morphologyEx(mask, cv2.MORPH_OPEN, k_open)
+                contours, _ = cv2.findContours(mask, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
+                if not contours:
+                    self._log(f"  снимок {i + 1}: объект не найден (пустая маска)")
+                    continue
+                bx, by, bw, bh = cv2.boundingRect(max(contours, key=cv2.contourArea))
+                if bw > fw_max or bh > fh_max:
+                    self._log(f"  снимок {i + 1}: blob слишком большой ({bw}×{bh}) — возможно тень или сдвиг фона, повторите")
+                    continue
+                pad = 15
+                x1 = max(0, bx - pad); y1 = max(0, by - pad)
+                x2 = min(frame.shape[1], bx + bw + pad); y2 = min(frame.shape[0], by + bh + pad)
+                roi = frame[y1:y2, x1:x2]
+                if roi.size > 0:
+                    shots.append(roi.copy())
+                    self._log(f"  снимок {i + 1} захвачен (blob {bw}×{bh})")
+                    i += 1
+            else:  # background_mog2
+                mask = mog2.detect_foreground(frame)
+                if mask is None:
+                    self._log(f"  снимок {i + 1}: ошибка маски MOG2")
+                    continue
+                result = mog2.extract_roi_from_mask(frame, mask)
+                if result is None:
+                    self._log(f"  снимок {i + 1}: объект не обнаружен (пустая маска MOG2)")
+                    continue
+                roi, (x1, y1, x2, y2) = result
+                w, h = x2 - x1, y2 - y1
+                if w > fw_max or h > fh_max:
+                    self._log(f"  снимок {i + 1}: blob слишком большой ({w}×{h}) — весь кадр засчитан foreground, повторите")
+                    continue
+                if roi.size > 0:
+                    shots.append(roi.copy())
+                    self._log(f"  снимок {i + 1} захвачен MOG2 (blob {w}×{h})")
+                    i += 1
 
         return shots
 
@@ -580,9 +744,9 @@ class GameScanner:
                         cv2.FONT_HERSHEY_SIMPLEX, 0.45, (255, 255, 255), 1)
 
     def start_registration(self, name: str):
-        if settings.REGISTRATION_MODE == 'background':
+        if settings.REGISTRATION_MODE in ('background', 'background_mog2'):
             self._pending_background_name = name
-            self._log(f"РЕЖИМ РЕГИСТРАЦИИ (background): '{name}'")
+            self._log(f"РЕЖИМ РЕГИСТРАЦИИ ({settings.REGISTRATION_MODE}): '{name}'")
         else:
             self.registration_name = name
             self.registration_mode = True
@@ -720,6 +884,10 @@ class GameScanner:
                 self._forward_engine_event(event)
                 self._chip_cells.clear()
                 self._chip_cell_debounce.clear()
+                self.turns.unfocus()
+                self._turn_profile = None
+                self._log("ИГРА ГОТОВА: нажмите [N] или Next Turn для первого хода")
+                self._sync_http_game_state()
                 # turns НЕ стартует здесь — первый [N] правильно начнёт с игрока 0
         elif key == ord('x'):
             entries = self.turns.list_entries()
@@ -733,6 +901,12 @@ class GameScanner:
                 self._text_input_mode = "remove_player"
                 self._text_input_buffer = ""
         elif key == ord('n'):
+            if not self.engine.is_active:
+                self.turns.unfocus()
+                self._log_pre_game_summary()
+                self._sync_http_game_state()
+                return False
+
             if self.engine.is_active and not self.engine.can_advance():
                 print("⚠️ Дождитесь выполнения хода перед передачей очереди.")
                 return False
@@ -744,6 +918,9 @@ class GameScanner:
                 self._log(f"EXTRA_TURN: игрок получает ещё один ход")
                 event = self.engine.begin_turn(chip_id)
                 self._forward_engine_event(event)
+                player = self.engine.state.get_player(chip_id)
+                if player:
+                    self._start_turn_profile(chip_id, player.name, self.engine.expected_cell, self.engine.turn_state)
                 # сброс состояния текущего хода для экстра-хода
                 self._chip_cells.pop(chip_id, None)
                 self._chip_cell_debounce.pop(chip_id, None)
@@ -754,6 +931,9 @@ class GameScanner:
                     if self.engine.is_active:
                         event = self.engine.begin_turn(entry["chip_id"])
                         self._forward_engine_event(event)
+                        self._start_turn_profile(
+                            entry["chip_id"], entry["player"], self.engine.expected_cell, self.engine.turn_state
+                        )
                         # сброс клетки активной фишки — иначе begin_turn пропустит уже известную позицию
                         self._chip_cells.pop(entry["chip_id"], None)
                         # сброс дебаунса — новый ход начинается с чистого листа
@@ -892,6 +1072,8 @@ class GameScanner:
                         if self.engine.turn_state in ("WAITING_MOVE", "AWAITING_RULE"):
                             self.engine.turn_state = "TURN_DONE"
                         self._log(f"⚠️ Удалённый игрок был активным. Очередь готова к продвижению.")
+                    self._turn_profile = None
+                    self._sync_http_game_state()
             else:
                 print(f"❌ Игрок '{value}' не найден в очереди.")
 
@@ -954,17 +1136,18 @@ class GameScanner:
             if self._pending_registration is not None:
                 roi_image, name, roi_coords = self._pending_registration
                 self._pending_registration = None
+                h, w = roi_image.shape[:2]
+                self._log(f"  снимок 1/{settings.REGISTRATION_SHOTS} захвачен (blob {w}×{h})")
                 self._register_object_from_roi(roi_image, name, roi_coords)
 
             if self._pending_background_name is not None:
                 name = self._pending_background_name
                 self._pending_background_name = None
-                shots = self._capture_background_shots(name, settings.REGISTRATION_SHOTS)
+                shots = self._capture_bg_shots(name, settings.REGISTRATION_SHOTS)
                 if shots:
                     self._register_object_from_roi(shots[0], name, pre_shots=shots)
                 else:
                     self._log(f"ОТМЕНА регистрации '{name}': нет снимков")
-
 
             # Извлечение признаков из текущего кадра
             with (p.measure('extract') if p else nullcontext()):
@@ -1023,6 +1206,16 @@ class GameScanner:
                     for oid in self._prev_active_ids - tracker_ids:
                         self._log(f"DISAPPEARED: '{self._active_names.get(oid, oid[:8])}'")
                     self._prev_active_ids = tracker_ids
+
+                    active_for_metrics = []
+                    for obj in self.tracker.get_active_objects():
+                        pos = obj.get_current_position()
+                        cell_num = self.field.pixel_to_cell_number(pos[0], pos[1]) if pos else None
+                        active_for_metrics.append({
+                            "name": self._active_names.get(obj.object_id, obj.object_id[:8]),
+                            "cell": cell_num,
+                        })
+                    self.metrics.update_active_objects(active_for_metrics)
                     
                     # Визуализация детекций
                     for detection in detections:
@@ -1052,11 +1245,12 @@ class GameScanner:
                         cv2.polylines(display_frame, [smooth_corners], True, (0, 255, 0), 2, cv2.LINE_AA)
                         cv2.circle(display_frame, smooth_center, 5, (0, 0, 255), -1)
 
-                        cell_num = self.field.pixel_to_cell_number(smooth_center[0], smooth_center[1])
-                        cell_pos = self.field.pixel_to_cell(smooth_center[0], smooth_center[1])
+                        cell_num = self.field.pixel_to_cell_number(center[0], center[1])
+                        cell_pos = self.field.pixel_to_cell(center[0], center[1])
                         if cell_num and cell_pos:
                             row, col = cell_pos
                             cell_str = f" [cell {cell_num} ({row+1},{col+1})]"
+                            self._mark_first_cell_seen(object_id, cell_num)
                             if self.engine.is_active and cell_num != self._chip_cells.get(object_id):
                                 # Дебаунс: требуем 3 consecutive frames на одной клетке перед фиксацией
                                 cached_cell, cached_count = self._chip_cell_debounce.get(object_id, (None, 0))
@@ -1069,9 +1263,12 @@ class GameScanner:
                                 if cached_count >= 3:
                                     # Зафиксировать движение
                                     self._chip_cells[object_id] = cell_num
+                                    accepted_state = self.engine.turn_state
                                     events = self.engine.on_chip_at_cell(object_id, cell_num)
                                     for event in events:
                                         self._forward_engine_event(event)
+                                    if events:
+                                        self._finish_turn_profile(object_id, cell_num, accepted_state)
                                     # Сброс дебаунса после фиксации
                                     del self._chip_cell_debounce[object_id]
                         else:
@@ -1107,12 +1304,18 @@ class GameScanner:
                     self._putText_stroked(display_frame, labels_short[i], (pt[0] + 10, pt[1] - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
 
-            # Победитель
+            # Победитель / готовность / текущий ход
             if self.engine.state.winner:
                 self._putText_stroked(
                     display_frame,
                     f"GAME OVER — {self.engine.state.winner.name} wins!",
                     (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 100), 2
+                )
+            elif self.engine.is_active and not self.turns.current():
+                self._putText_stroked(
+                    display_frame,
+                    "GAME READY — press [N] or Next Turn",
+                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 100), 2
                 )
             # Информация о текущем ходе + статус FSM
             elif turn_entry := self.turns.current():
@@ -1157,6 +1360,15 @@ class GameScanner:
                 display_frame = cv2.resize(display_frame, (dw, dh))
             cv2.imshow(settings.WINDOW_NAME, display_frame)
             self.metrics.render()
+
+            # Кадр → MJPEG стрим (encode после resize чтобы слать уменьшенный кадр)
+            _, jpeg = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+            self.http_server.update_stream_frame(jpeg.tobytes())
+
+            # HTTP команды → эмуляция клавиши (приоритет ниже реальной клавиши)
+            for cmd in self.http_server.drain_commands():
+                if cmd == "next" and self._pending_key is None:
+                    self._pending_key = ord('n')
 
             # Обработка клавиатуры и кликов по кнопкам
             key = cv2.waitKey(1) & 0xFF
