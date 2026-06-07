@@ -17,16 +17,12 @@ Fallback guarantees:
   - During warm-up (history shorter than min_hits): all keypoints pass through.
   - If the filter would drop all keypoints: all keypoints pass through.
 
-Integration note:
-  Not wired into tracking_loop yet. Instantiate TemporalStabilityFilter,
-  call filter(kp, des) after FeatureExtractor.extract_features(), before
-  ObjectDetector.detect_objects(). Call reset() after registration or
-  when the scene changes significantly.
+Integration:
+  Wired in tracking_loop (game_scanner.py) after extract_features(), before
+  detect_objects(). Controlled by TEMPORAL_FILTER_ENABLED in settings.py.
+  reset() called after every registration to avoid stale history.
 
 Parameters live in config/settings.py (TEMPORAL_FILTER_*).
-TEMPORAL_FILTER_ENABLED is defined there for documentation; the filter
-must be instantiated and called explicitly — setting the flag alone has
-no effect until integration is complete.
 """
 
 import numpy as np

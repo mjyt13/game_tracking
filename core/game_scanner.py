@@ -15,6 +15,7 @@ from camera.camera_manager import CameraManager
 from scanner.feature_extractor import FeatureExtractor
 from scanner.object_detector import ObjectDetector
 from scanner.background_subtractor import MOG2BackgroundLearner
+from scanner.temporal_filter import TemporalStabilityFilter
 from memory.object_registry import ObjectRegistry
 from memory.feature_storage import FeatureStorage
 from tracker.object_tracker import ObjectTracker
@@ -28,7 +29,7 @@ from game.field_calibration import FieldCalibration
 from game.game_engine import GameEngine
 from game.game_state_manager import GameStateManager
 from game.events import Player
-from http_server import GameEventServer
+from server import GameEventServer
 
 
 class GameScanner:
@@ -47,7 +48,10 @@ class GameScanner:
             inactive_threshold=settings.TRACKER_INACTIVE_FRAMES,
         )
         self.projector = ProjectorController()
-        
+        self.temporal_filter = TemporalStabilityFilter()
+        self._web_reg_name: str | None = None
+        self._web_reg_shots: list = []
+
         # Состояние регистрации
         self.registration_mode = False
         self.registration_name = "New_Piece"
@@ -100,6 +104,7 @@ class GameScanner:
         # HTTP сервер для событий
         self.http_server = GameEventServer()
         self.http_server.start()
+        self._sync_chips_http()
 
         # Флаги
         self.running = False
@@ -118,6 +123,7 @@ class GameScanner:
             "turn_state": self.engine.turn_state,
             "expected_cell": self.engine.expected_cell,
             "rule_target": self.engine.rule_target,
+            "dice_roll": self.engine._last_dice_roll,
             "board_size": self.engine.state.board_size,
             "winner": winner.name if winner else None,
             "current_turn": dict(turn_entry) if turn_entry else None,
@@ -125,14 +131,126 @@ class GameScanner:
             "players": [
                 {
                     "name": p.name,
+                    "chip_id": p.chip_id,
                     "chip_name": p.chip_name,
                     "cell": p.cell,
                     "skip_turns": p.skip_turns,
                 }
                 for p in self.engine.state.players
             ],
+            # очередь ожидающих (до старта игры) — для экрана ожидания и админа
+            "queue": [
+                {"player": e["player"], "chip_name": e["chip_name"], "chip_id": e["chip_id"]}
+                for e in self.turns.list_entries()
+            ],
         }
         self.http_server.update_game_state(state)
+
+    def _build_cell_colors(self) -> dict:
+        """Сопоставить номер клетки → цвет заливки (BGR) по правилам поля + финиш."""
+        colors: dict[int, tuple] = {}
+        for num, rule in game_rules.CELL_RULES.items():
+            c = settings.CELL_EFFECT_COLORS.get(rule.get("effect"))
+            if c:
+                colors[num] = c
+        # Финишная клетка — последняя в маршруте
+        if self.field.is_calibrated() and self.field.path_manager:
+            finish_color = settings.CELL_EFFECT_COLORS.get("FINISH")
+            if finish_color:
+                colors[self.field.path_manager.get_board_size()] = finish_color
+        return colors
+
+    def _sync_chips_http(self) -> None:
+        """Обновить списки фишек и миниатюры для /api/chips, /join и админа."""
+        all_chips = self.registry.list_objects()
+        assigned = {e["chip_id"] for e in self.turns.list_entries()}
+        available = [{"id": c["id"], "name": c["name"]} for c in all_chips if c["id"] not in assigned]
+        self.http_server.update_available_chips(available)
+        self.http_server.update_all_chips([{"id": c["id"], "name": c["name"]} for c in all_chips])
+
+        # Миниатюры фишек (JPEG) для веб-интерфейса
+        images: dict[str, bytes] = {}
+        for c in all_chips:
+            obj = self.registry.get_object(c["id"])
+            img = obj.get("img") if obj else None
+            if img is not None and img.size > 0:
+                thumb = cv2.resize(img, (settings.THUMBNAIL_SIZE, settings.THUMBNAIL_SIZE))
+                ok, buf = cv2.imencode('.jpg', thumb, [cv2.IMWRITE_JPEG_QUALITY, 70])
+                if ok:
+                    images[c["id"]] = buf.tobytes()
+        self.http_server.update_chip_images(images)
+
+    def _reset_if_finished(self) -> None:
+        """Если прошлая игра завершена (есть победитель) — сбросить движок,
+        чтобы старая надпись GAME OVER не висела во время подготовки новой игры."""
+        if self.engine.state.winner and not self.engine.state.active:
+            self.engine = GameEngine()
+            self._chip_cells.clear()
+            self._chip_cell_debounce.clear()
+            self._turn_profile = None
+            self._sync_http_game_state()
+
+    def _end_game(self) -> None:
+        """Стоп партии: сброс движка (без остановки приложения)."""
+        self.engine = GameEngine()
+        self._chip_cells.clear()
+        self._chip_cell_debounce.clear()
+        self._turn_profile = None
+        self.turns.unfocus()
+        self._log("СТОП ПАРТИИ: движок сброшен, система продолжает работу")
+        self._sync_http_game_state()
+
+    def _delete_chip_by_value(self, value: str) -> None:
+        """Удалить фишку по id или имени (для веб-админа)."""
+        objects = self.registry.list_objects()
+        target = next((o for o in objects if o["id"] == value or o["name"] == value), None)
+        if target:
+            self.registry.delete_object(target["id"])
+            self._log(f"УДАЛЕНИЕ [HTTP]: '{target['name']}' id={target['id'][:8]}")
+            self._sync_chips_http()
+            self._sync_http_game_state()
+        else:
+            self._log(f"⚠️ Фишка '{value}' не найдена для удаления")
+
+    def _calibrate_from_web(self, corners_norm: list, cols: int, rows: int, frame) -> None:
+        """Калибровка поля по 4 нормированным углам [x,y] из веба + размер сетки."""
+        fh, fw = frame.shape[:2]
+        try:
+            corners_px = [(int(x * fw), int(y * fh)) for x, y in corners_norm]
+        except (TypeError, ValueError):
+            self._log("⚠️ Некорректные углы калибровки из веба")
+            return
+        if len(corners_px) != 4 or cols < 1 or rows < 1:
+            self._log("⚠️ Калибровка из веба отклонена (нужно 4 угла, размер ≥1)")
+            return
+        self.field.set_corners(corners_px, cols, rows)
+        self.field.save("items/field_calibration.json")
+        self._grid_visible = True
+        self._log(f"ПОЛЕ [HTTP]: откалибровано {cols}×{rows}, сохранено")
+        self.http_server.emit_event("NOTICE", {"message": f"Поле откалибровано: {cols}×{rows}", "level": "info"})
+        self._sync_http_game_state()
+
+    def _remove_player_by_value(self, value: str) -> None:
+        """Удалить игрока из очереди по имени/номеру (для веб-админа). Синхронизирует движок."""
+        chip_id = self.turns.remove(value)
+        if not chip_id:
+            self._log(f"⚠️ Игрок '{value}' не найден в очереди")
+            return
+        self._log(f"ОЧЕРЕДЬ [HTTP]: игрок удалён ('{value}')")
+        self._sync_chips_http()
+        if self.engine.is_active:
+            player = self.engine.state.get_player(chip_id)
+            if player:
+                self.engine.state.players.remove(player)
+                self._log(f"ENGINE: игрок '{player.name}' удалён из состояния")
+            if self.engine._active_chip_id == chip_id:
+                self.engine._active_chip_id = None
+                self.engine._pending_extra_turn = None
+                if self.engine.turn_state in ("WAITING_MOVE", "AWAITING_RULE"):
+                    self.engine.turn_state = "TURN_DONE"
+                self._log("⚠️ Удалённый игрок был активным. Очередь готова к продвижению.")
+            self._turn_profile = None
+        self._sync_http_game_state()
 
     def _forward_engine_event(self, event) -> None:
         """Отправить событие GameEngine в HTTP сервер"""
@@ -700,6 +818,11 @@ class GameScanner:
         """Отрисовать оверлей с подсказкой и кнопки управления на кадре."""
         h, w = frame.shape[:2]
 
+        # Панель команд и кнопки управления — только если включён оверлей cv2
+        if not settings.CV2_SHOW_OVERLAY:
+            self._button_rects = []
+            return
+
         # Полупрозрачный блок с инструкциями (правый верхний угол)
         lines = ["Controls:", "[R] Register", "[L] List", "[D] Delete", "[I] Images",
                  "[T] Add player", "[X] Remove player", "[S] Start game",
@@ -870,12 +993,19 @@ class GameScanner:
             self._show_thumbnails()
             self._pending_key = None  # игнорировать клики, накопленные во время просмотра
         elif key == ord('t'):
+            self._reset_if_finished()
             self._text_input_mode = "turn_player"
             self._text_input_buffer = ""
         elif key == ord('s'):
             entries = self.turns.list_entries()
             if not entries:
-                print("⚠️ Очередь пуста. Добавьте игроков через [T].")
+                msg = "Очередь пуста. Добавьте игроков через [T]."
+                print(f"⚠️ {msg}")
+                self.http_server.emit_event("NOTICE", {"message": msg, "level": "error"})
+            elif not settings.ALLOW_SINGLE_PLAYER and len(entries) < 2:
+                msg = f"Нужно 2+ игроков для старта (сейчас {len(entries)}). Добавьте ещё через [T]."
+                print(f"⚠️ {msg}")
+                self.http_server.emit_event("NOTICE", {"message": msg, "level": "error"})
             else:
                 players = [Player(e["player"], e["chip_id"], e["chip_name"]) for e in entries]
                 board_size = (self.field.grid_cols * self.field.grid_rows
@@ -1011,7 +1141,9 @@ class GameScanner:
                         self._log(f"УДАЛЕНИЕ: '{obj['name']}' id={obj['id'][:8]}")
                         deleted = True
                         break
-            if not deleted and value:
+            if deleted:
+                self._sync_chips_http()
+            elif value:
                 print(f"❌ Фишка '{value}' не найдена.")
 
         elif mode == "turn_player":
@@ -1048,6 +1180,8 @@ class GameScanner:
             if chip:
                 self.turns.add(player_name, chip["id"], chip["name"])
                 self._log(f"ОЧЕРЕДЬ: игрок '{player_name}' → фишка '{chip['name']}'")
+                self._sync_chips_http()
+                self._sync_http_game_state()
             else:
                 print(f"❌ Фишка '{value}' не найдена.")
 
@@ -1057,6 +1191,7 @@ class GameScanner:
             chip_id = self.turns.remove(value)
             if chip_id:
                 self._log(f"ОЧЕРЕДЬ: игрок удалён ('{value}')")
+                self._sync_chips_http()
                 # Синхронизировать с GameEngine — удалить из состояния игры
                 if self.engine.is_active:
                     player = self.engine.state.get_player(chip_id)
@@ -1073,7 +1208,7 @@ class GameScanner:
                             self.engine.turn_state = "TURN_DONE"
                         self._log(f"⚠️ Удалённый игрок был активным. Очередь готова к продвижению.")
                     self._turn_profile = None
-                    self._sync_http_game_state()
+                self._sync_http_game_state()
             else:
                 print(f"❌ Игрок '{value}' не найден в очереди.")
 
@@ -1139,6 +1274,8 @@ class GameScanner:
                 h, w = roi_image.shape[:2]
                 self._log(f"  снимок 1/{settings.REGISTRATION_SHOTS} захвачен (blob {w}×{h})")
                 self._register_object_from_roi(roi_image, name, roi_coords)
+                self.temporal_filter.reset()
+                self._sync_chips_http()
 
             if self._pending_background_name is not None:
                 name = self._pending_background_name
@@ -1146,17 +1283,24 @@ class GameScanner:
                 shots = self._capture_bg_shots(name, settings.REGISTRATION_SHOTS)
                 if shots:
                     self._register_object_from_roi(shots[0], name, pre_shots=shots)
+                    self.temporal_filter.reset()
+                    self._sync_chips_http()
                 else:
                     self._log(f"ОТМЕНА регистрации '{name}': нет снимков")
 
             # Извлечение признаков из текущего кадра
             with (p.measure('extract') if p else nullcontext()):
                 kp_frame, des_frame = self.feature_extractor.extract_features(frame)
+                if settings.TEMPORAL_FILTER_ENABLED:
+                    kp_frame, des_frame = self.temporal_filter.filter(kp_frame, des_frame)
 
             # Визуализация
             display_frame = frame.copy()
             if self._grid_visible:
                 self.field.draw_grid(display_frame)
+                self.field.draw_cell_fills(display_frame, self._build_cell_colors(),
+                                           settings.CELL_FILL_ALPHA)
+                self.field.draw_cell_numbers(display_frame, settings.CELL_NUMBER_COLOR)
 
             if des_frame is not None and len(des_frame) > 0:
                 # Получение всех зарегистрированных объектов
@@ -1242,8 +1386,9 @@ class GameScanner:
                             corners_int + np.array([[[dx, dy]]], dtype=np.int32)
                         )
 
-                        cv2.polylines(display_frame, [smooth_corners], True, (0, 255, 0), 2, cv2.LINE_AA)
-                        cv2.circle(display_frame, smooth_center, 5, (0, 0, 255), -1)
+                        if settings.CV2_SHOW_BBOX:
+                            cv2.polylines(display_frame, [smooth_corners], True, (0, 255, 0), 2, cv2.LINE_AA)
+                            cv2.circle(display_frame, smooth_center, 5, (0, 0, 255), -1)
 
                         cell_num = self.field.pixel_to_cell_number(center[0], center[1])
                         cell_pos = self.field.pixel_to_cell(center[0], center[1])
@@ -1273,12 +1418,13 @@ class GameScanner:
                                     del self._chip_cell_debounce[object_id]
                         else:
                             cell_str = ""
-                        label = f"{object_name}{cell_str} ({confidence:.2f}, {matches_count})"
-                        self._putText_stroked(
-                            display_frame, label,
-                            (smooth_corners[0][0][0], smooth_corners[0][0][1] - 10),
-                            cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2
-                        )
+                        if settings.CV2_SHOW_BBOX:
+                            label = f"{object_name}{cell_str} ({confidence:.2f}, {matches_count})"
+                            self._putText_stroked(
+                                display_frame, label,
+                                (smooth_corners[0][0][0], smooth_corners[0][0][1] - 10),
+                                cv2.FONT_HERSHEY_SIMPLEX, 0.6, (255, 255, 0), 2
+                            )
                         
                         # Вывод в консоль (опционально, можно отключить для производительности)
                         # print(f"Объект '{object_name}' (ID: {object_id[:8]}...) найден! Центр: {center}, Уверенность: {confidence:.2f}")
@@ -1367,8 +1513,85 @@ class GameScanner:
 
             # HTTP команды → эмуляция клавиши (приоритет ниже реальной клавиши)
             for cmd in self.http_server.drain_commands():
-                if cmd == "next" and self._pending_key is None:
+                if self._pending_key is not None:
+                    continue
+                if cmd == "next":
                     self._pending_key = ord('n')
+                elif cmd == "start":
+                    self._pending_key = ord('s')
+                elif cmd == "grid":
+                    self._pending_key = ord('g')
+                elif cmd == "quit":
+                    self._pending_key = ord('q')
+                elif cmd == "endgame":
+                    self._end_game()
+
+            # HTTP админ-команды (удаление фишки / игрока, калибровка)
+            for acmd in self.http_server.drain_admin():
+                if acmd["action"] == "delete_chip":
+                    self._delete_chip_by_value(acmd["value"])
+                elif acmd["action"] == "remove_player":
+                    self._remove_player_by_value(acmd["value"])
+                elif acmd["action"] == "calibrate":
+                    self._calibrate_from_web(acmd["corners"], acmd["cols"], acmd["rows"], frame)
+
+            # HTTP веб-регистрация
+            for cmd in self.http_server.drain_register_commands():
+                if cmd["action"] == "start":
+                    self._web_reg_name = cmd["name"]
+                    self._web_reg_shots = []
+                    self._log(f"WEB REGISTER: '{cmd['name']}' ({settings.REGISTRATION_SHOTS} снимков)")
+                    self.http_server.update_reg_status({
+                        "active": True, "shot_num": 0,
+                        "total": settings.REGISTRATION_SHOTS, "name": cmd["name"], "done": False,
+                    })
+                elif cmd["action"] == "shot" and self._web_reg_name:
+                    fh, fw = frame.shape[:2]
+                    x1 = max(0, int(cmd["x1"] * fw))
+                    y1 = max(0, int(cmd["y1"] * fh))
+                    x2 = min(fw, int(cmd["x2"] * fw))
+                    y2 = min(fh, int(cmd["y2"] * fh))
+                    if x2 > x1 + 4 and y2 > y1 + 4:
+                        roi = frame[y1:y2, x1:x2].copy()
+                        if roi.size > 0:
+                            self._web_reg_shots.append(roi)
+                            sn = len(self._web_reg_shots)
+                            total = settings.REGISTRATION_SHOTS
+                            self._log(f"WEB REGISTER: снимок {sn}/{total}")
+                            if sn >= total:
+                                name = self._web_reg_name
+                                shots = self._web_reg_shots
+                                self._web_reg_name = None
+                                self._web_reg_shots = []
+                                self._register_object_from_roi(shots[0], name, pre_shots=shots)
+                                self.temporal_filter.reset()
+                                self._sync_chips_http()
+                                self.http_server.update_reg_status({
+                                    "active": False, "shot_num": sn, "total": total, "name": name, "done": True,
+                                })
+                            else:
+                                self.http_server.update_reg_status({
+                                    "active": True, "shot_num": sn,
+                                    "total": total, "name": self._web_reg_name, "done": False,
+                                })
+                elif cmd["action"] == "cancel":
+                    self._web_reg_name = None
+                    self._web_reg_shots = []
+                    self.http_server.update_reg_status({
+                        "active": False, "shot_num": 0,
+                        "total": settings.REGISTRATION_SHOTS, "name": "", "done": False,
+                    })
+
+            # HTTP join → добавить игрока в очередь
+            for join in self.http_server.drain_joins():
+                jname, jchip_id = join["name"], join["chip_id"]
+                chip = next((c for c in self.registry.list_objects() if c["id"] == jchip_id), None)
+                if chip:
+                    self._reset_if_finished()
+                    self.turns.add(jname, chip["id"], chip["name"])
+                    self._log(f"ОЧЕРЕДЬ [HTTP]: игрок '{jname}' → фишка '{chip['name']}'")
+                    self._sync_chips_http()
+                    self._sync_http_game_state()
 
             # Обработка клавиатуры и кликов по кнопкам
             key = cv2.waitKey(1) & 0xFF

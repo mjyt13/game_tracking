@@ -82,6 +82,45 @@ class FieldCalibration:
         for corner in self.corners:
             cv2.circle(frame, corner, 6, (0, 255, 255), 2)
 
+    def _cell_polygon(self, row: int, col: int) -> np.ndarray:
+        """Четыре угла клетки (row, col) в пиксельных координатах кадра."""
+        fx0, fx1 = col / self.grid_cols, (col + 1) / self.grid_cols
+        fy0, fy1 = row / self.grid_rows, (row + 1) / self.grid_rows
+        pts = [self.field_to_pixel(fx0, fy0), self.field_to_pixel(fx1, fy0),
+               self.field_to_pixel(fx1, fy1), self.field_to_pixel(fx0, fy1)]
+        return np.array(pts, dtype=np.int32)
+
+    def draw_cell_fills(self, frame: np.ndarray, cell_colors: dict, alpha: float) -> None:
+        """Полупрозрачная заливка клеток с эффектами.
+        cell_colors: {номер_клетки: (B, G, R)}. Рисуется только на отображаемом кадре."""
+        if not self.is_calibrated() or not self.path_manager or not cell_colors:
+            return
+        overlay = frame.copy()
+        for num, color in cell_colors.items():
+            pos = self.path_manager.cell_number_to_position(num)
+            if pos is None:
+                continue
+            cv2.fillPoly(overlay, [self._cell_polygon(pos[0], pos[1])], color)
+        cv2.addWeighted(overlay, alpha, frame, 1 - alpha, 0, frame)
+
+    def draw_cell_numbers(self, frame: np.ndarray, color=(255, 255, 255)) -> None:
+        """Номер клетки (в порядке маршрута) в центре каждой клетки, с тёмной обводкой."""
+        if not self.is_calibrated() or not self.path_manager:
+            return
+        font = cv2.FONT_HERSHEY_SIMPLEX
+        for row in range(self.grid_rows):
+            for col in range(self.grid_cols):
+                num = self.path_manager.position_to_cell_number(row, col)
+                if num is None:
+                    continue
+                cx, cy = self.field_to_pixel((col + 0.5) / self.grid_cols,
+                                             (row + 0.5) / self.grid_rows)
+                text = str(num)
+                (tw, th), _ = cv2.getTextSize(text, font, 0.5, 1)
+                org = (cx - tw // 2, cy + th // 2)
+                cv2.putText(frame, text, org, font, 0.5, (0, 0, 0), 3, cv2.LINE_AA)
+                cv2.putText(frame, text, org, font, 0.5, color, 1, cv2.LINE_AA)
+
     def save(self, path: str) -> None:
         os.makedirs(os.path.dirname(path), exist_ok=True)
         data = {
