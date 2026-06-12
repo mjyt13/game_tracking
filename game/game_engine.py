@@ -46,7 +46,7 @@ class GameEngine:
     def begin_turn(self, chip_id: str, dice_roll: int | None = None) -> Event:
         """Начало хода. Вызывается при [N] после TurnManager.advance(). dice_roll — движение вперёд; если None, рандомный 1–6."""
         if dice_roll is None:
-            dice_roll = random.randint(1, 6)
+            dice_roll = random.randint(game_rules.DICE_MIN, game_rules.DICE_MAX)
         self._last_dice_roll = dice_roll
 
         player = self.state.get_player(chip_id)
@@ -54,6 +54,7 @@ class GameEngine:
             return self._emit(TURN_START, {"player": chip_id[:8], "dice_roll": dice_roll})
 
         self._active_chip_id = chip_id
+        self.rule_target = 0  # сброс цели правила прошлого хода (иначе UI покажет устаревшую клетку)
 
         if player.skip_turns > 0:
             player.skip_turns -= 1
@@ -89,52 +90,66 @@ class GameEngine:
         if self.turn_state == WAITING_MOVE:
             if cell != self.expected_cell:
                 return []  # неверная клетка — UI покажет инструкцию
-
             old_cell = player.cell
             self.state.move_player(player, cell)
             fired.append(self._emit(CHIP_MOVED, {"player": player.name, "from": old_cell, "to": cell}))
-
-            if self.rules.is_finish(cell):
-                self.state.winner = player
-                self.state.active = False
-                self.turn_state = IDLE
-                fired.append(self._emit(GAME_OVER, {"winner": player.name}))
-                return fired
-
-            effect = self.rules.get_effect(cell)
-            if effect is None:
-                self.turn_state = TURN_DONE
-            elif effect.type == SKIP_TURN:
-                self.state.apply_effect(player, effect)
-                fired.append(self._emit(RULE_TRIGGERED, {"player": player.name, "cell": cell, "effect": effect.type}))
-                self.turn_state = TURN_DONE
-            elif effect.type == EXTRA_TURN:
-                self.state.apply_effect(player, effect)
-                fired.append(self._emit(RULE_TRIGGERED, {"player": player.name, "cell": cell, "effect": effect.type}))
-                # Отметить, что этому игроку нужен экстра-ход (следующий [N] даст их ещё один ход вместо смены игрока)
-                self._pending_extra_turn = chip_id
-                self.turn_state = TURN_DONE
-            elif effect.type in (MOVE_FORWARD, MOVE_BACK):
-                delta = effect.distance if effect.type == MOVE_FORWARD else -effect.distance
-                self.rule_target = max(1, min(player.cell + delta, self.state.board_size))
-                fired.append(self._emit(RULE_TRIGGERED, {
-                    "player": player.name, "cell": cell,
-                    "effect": effect.type, "distance": effect.distance, "target": self.rule_target,
-                }))
-                self.turn_state = AWAITING_RULE
+            self._apply_cell_rule(player, chip_id, cell, fired)
 
         elif self.turn_state == AWAITING_RULE:
             if cell != self.rule_target:
                 return []  # неверная клетка
-
             old_cell = player.cell
             self.state.move_player(player, cell)
             fired.append(self._emit(CHIP_MOVED, {
                 "player": player.name, "from": old_cell, "to": cell, "rule_executed": True,
             }))
-            self.turn_state = TURN_DONE
+            # Цепочка правил: клетка, на которую переместила фишку предыдущая правило,
+            # сама может нести правило (например, MOVE_FORWARD привёл на клетку с MOVE_BACK).
+            self._apply_cell_rule(player, chip_id, cell, fired)
 
         return fired
+
+    def _apply_cell_rule(self, player, chip_id: str, cell: int, fired: list) -> None:
+        """Оценить правило клетки, на которой оказалась фишка, и выставить следующее состояние FSM.
+        Вызывается и при приземлении по броску, и при приземлении по правилу (цепочка)."""
+        if self.rules.is_finish(cell):
+            self.state.winner = player
+            self.state.active = False
+            self.rule_target = 0
+            self.turn_state = IDLE
+            fired.append(self._emit(GAME_OVER, {"winner": player.name}))
+            return
+
+        effect = self.rules.get_effect(cell)
+        if effect is None:
+            self.rule_target = 0
+            self.turn_state = TURN_DONE
+        elif effect.type == SKIP_TURN:
+            self.state.apply_effect(player, effect)
+            fired.append(self._emit(RULE_TRIGGERED, {"player": player.name, "cell": cell, "effect": effect.type}))
+            self.rule_target = 0
+            self.turn_state = TURN_DONE
+        elif effect.type == EXTRA_TURN:
+            self.state.apply_effect(player, effect)
+            fired.append(self._emit(RULE_TRIGGERED, {"player": player.name, "cell": cell, "effect": effect.type}))
+            # Отметить, что этому игроку нужен экстра-ход (следующий [N] даст ему ещё один ход вместо смены игрока)
+            self._pending_extra_turn = chip_id
+            self.rule_target = 0
+            self.turn_state = TURN_DONE
+        elif effect.type in (MOVE_FORWARD, MOVE_BACK):
+            delta = effect.distance if effect.type == MOVE_FORWARD else -effect.distance
+            target = max(1, min(player.cell + delta, self.state.board_size))
+            if target == player.cell:
+                # двигаться некуда (упёрлись в край поля) — завершить ход
+                self.rule_target = 0
+                self.turn_state = TURN_DONE
+                return
+            self.rule_target = target
+            fired.append(self._emit(RULE_TRIGGERED, {
+                "player": player.name, "cell": cell,
+                "effect": effect.type, "distance": effect.distance, "target": target,
+            }))
+            self.turn_state = AWAITING_RULE
 
     def status_msg(self) -> tuple[str, tuple[int, int, int]] | None:
         """Текст и цвет для отображения статуса FSM на кадре. None если нечего показывать."""

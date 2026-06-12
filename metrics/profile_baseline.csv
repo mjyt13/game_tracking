@@ -1,0 +1,10 @@
+section,avg_ms,pct
+camera,17.56,1.6
+extract,252.80,23.5
+detect,655.81,61.0
+tracker,0.02,0.0
+field,0.01,0.0
+draw,0.01,0.0
+show,137.05,12.8
+mjpeg,11.50,1.1
+TOTAL,1074.76,100

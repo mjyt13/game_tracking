@@ -29,6 +29,13 @@ ADMIN_HTML = """<!DOCTYPE html>
     button:active { background: #444; }
     button.danger { border-color: #a33; color: #f88; }
     button.go { border-color: #2a6; color: #6fc; }
+    select#pathSel { padding: 9px 10px; font-size: 13px; background: #222; color: #ddd;
+      border: 1px solid #444; border-radius: 6px; font-family: monospace; cursor: pointer; }
+    #panelToggle {
+      position: fixed; top: 8px; right: 8px; z-index: 400;
+      padding: 6px 11px; font-size: 13px; font-family: monospace; cursor: pointer;
+      background: rgba(20,20,20,0.85); color: #ddd; border: 1px solid #555; border-radius: 6px;
+    }
     /* dynamic admin panel (list/delete/images/add/remove player) */
     #dynPanel { margin-top: 10px; padding: 10px; background: #1a1a1a; border: 1px solid #444; border-radius: 6px; display: none; }
     #dynPanel .ttl { font-size: 14px; color: #4fc; margin-bottom: 8px; }
@@ -65,6 +72,7 @@ ADMIN_HTML = """<!DOCTYPE html>
       background: #2a6; color: #fff; border: none; border-radius: 6px; cursor: pointer;
     }
     #loginErr { color: #f64; font-size: 14px; margin-top: 10px; min-height: 18px; }
+    #loginJoinUrl a { color: #4af; text-decoration: none; word-break: break-all; }
     /* registration panel */
     #regPanel { margin-top: 10px; padding: 10px; background: #1a1a1a; border: 1px solid #444; border-radius: 6px; display: none; }
     #regPanel input { background: #222; color: #ddd; border: 1px solid #444; border-radius: 4px; padding: 6px 10px; font-size: 14px; font-family: monospace; width: 180px; }
@@ -86,12 +94,18 @@ ADMIN_HTML = """<!DOCTYPE html>
 </head>
 <body>
   <div id="login">
+    <h2 style="margin-bottom:12px">Подключение игроков</h2>
+    <img id="loginQr" alt="QR для подключения" style="width:180px;height:180px;background:#fff;padding:8px;border-radius:8px;display:none">
+    <div id="loginJoinUrl" style="margin-top:10px;font-size:14px"></div>
+    <div style="margin-top:4px;color:#555;font-size:13px">Наведите камеру телефона на QR</div>
+    <hr style="width:240px;border:none;border-top:1px solid #333;margin:22px 0">
     <h2>Кабинет ведущего</h2>
     <input id="loginPw" type="password" placeholder="Пароль" autocomplete="current-password">
     <button onclick="doLogin()">Войти</button>
     <div id="loginErr"></div>
   </div>
   <div id="notification"></div>
+  <button id="panelToggle" onclick="togglePanel()">Скрыть панель</button>
   <div id="panel">
     <div class="row" id="turn"></div>
     <div class="row" id="players"></div>
@@ -108,6 +122,11 @@ ADMIN_HTML = """<!DOCTYPE html>
         <button data-act="removeplayer">&minus; Игрок</button>
         <button data-act="grid">&#9638; Сетка вкл/выкл</button>
         <button data-act="calibrate">&#9712; Калибровка</button>
+        <select id="pathSel" title="Порядок обхода клеток">
+          <option value="linear">Маршрут: линейный</option>
+          <option value="snake">Маршрут: змейка</option>
+          <option value="spiral">Маршрут: спираль</option>
+        </select>
       </div>
       <div class="col">
         <div class="ch">Игра</div>
@@ -117,6 +136,7 @@ ADMIN_HTML = """<!DOCTYPE html>
       </div>
       <div class="col">
         <div class="ch">Система</div>
+        <button data-act="overlay">&#9783; Панель cv2 вкл/выкл</button>
         <button data-act="stop" class="danger">&#9211; Выключить систему</button>
       </div>
     </div>
@@ -166,22 +186,35 @@ ADMIN_HTML = """<!DOCTYPE html>
     if (sessionStorage.getItem('adminOk') === '1') showPanel();
 
     // --- ссылка и QR для подключения (берём реальный LAN-IP с сервера) ---
-    function initConnect() {
+    // qrId/urlId позволяют показать QR и на странице входа, и в панели после входа
+    function loadConnect(qrId, urlId) {
+      const urlEl = document.getElementById(urlId);
+      const qr = document.getElementById(qrId);
       fetch('/api/netinfo').then(r => r.json()).then(d => {
         const host = d.ip || window.location.hostname;
         const joinUrl = 'http://' + host + ':' + (d.port || 5000) + '/join';
-        document.getElementById('joinurl').innerHTML =
-          '<a href="' + joinUrl + '" target="_blank">' + joinUrl + '</a>';
-        const qr = document.getElementById('qr');
-        qr.src = '/api/qr';
-        qr.onload = () => { qr.style.display = 'block'; };
-        qr.onerror = () => { qr.style.display = 'none'; };
+        if (urlEl) urlEl.innerHTML = '<a href="' + joinUrl + '" target="_blank">' + joinUrl + '</a>';
+        if (qr) {
+          qr.src = '/api/qr';
+          qr.onload = () => { qr.style.display = 'block'; };
+          qr.onerror = () => { qr.style.display = 'none'; };
+        }
       }).catch(() => {
         const joinUrl = window.location.protocol + '//' + window.location.hostname +
           (window.location.port ? ':' + window.location.port : '') + '/join';
-        document.getElementById('joinurl').innerHTML =
-          '<a href="' + joinUrl + '" target="_blank">' + joinUrl + '</a>';
+        if (urlEl) urlEl.innerHTML = '<a href="' + joinUrl + '" target="_blank">' + joinUrl + '</a>';
       });
+    }
+    function initConnect() { loadConnect('qr', 'joinurl'); }
+    // QR на странице входа доступен сразу, до авторизации
+    loadConnect('loginQr', 'loginJoinUrl');
+
+    // свернуть/развернуть всю веб-панель управления (чтобы видеть поле целиком)
+    function togglePanel() {
+      const p = document.getElementById('panel');
+      const hidden = p.style.display === 'none';
+      p.style.display = hidden ? '' : 'none';
+      document.getElementById('panelToggle').textContent = hidden ? 'Скрыть панель' : 'Показать панель';
     }
 
     // --- панель управления (4 столбца кнопок) ---
@@ -193,6 +226,16 @@ ADMIN_HTML = """<!DOCTYPE html>
     document.getElementById('cols').addEventListener('click', e => {
       const btn = e.target.closest('button[data-act]');
       if (btn) handleAct(btn.dataset.act);
+    });
+
+    // смена порядка обхода клеток поля
+    document.getElementById('pathSel').addEventListener('change', e => {
+      fetch('/api/game/path', {
+        method: 'POST', headers: {'Content-Type': 'application/json'},
+        body: JSON.stringify({type: e.target.value})
+      }).then(r => r.json()).then(d => {
+        if (d.error) showNotice(d.error);
+      }).catch(() => {});
     });
 
     function closeDyn() { dyn.style.display = 'none'; dyn.innerHTML = ''; dynMode = null; }
@@ -214,6 +257,7 @@ ADMIN_HTML = """<!DOCTYPE html>
       if (act === 'next')      { cmd('next'); }
       else if (act === 'start'){ cmd('start'); }
       else if (act === 'grid') { cmd('grid'); }
+      else if (act === 'overlay') { cmd('overlay'); }
       else if (act === 'endgame') { if (confirm('Остановить текущую партию?')) cmd('endgame'); }
       else if (act === 'stop') { if (confirm('Выключить систему и сервер? Веб перестанет работать.')) cmd('stop'); }
       else if (act === 'calibrate') { openCalibrate(); }
@@ -315,6 +359,11 @@ ADMIN_HTML = """<!DOCTYPE html>
     function update() {
       fetch('/api/game/state').then(r => r.json()).then(data => {
         const s = data.state || {};
+        // отразить реальный маршрут поля в выпадающем списке (не мешая выбору пользователя)
+        const psel = document.getElementById('pathSel');
+        if (s.path_type && psel && document.activeElement !== psel && psel.value !== s.path_type) {
+          psel.value = s.path_type;
+        }
         if (!s.active) {
           const winner = s.winner
             ? 'GAME OVER: <span class="player">' + s.winner + '</span> wins'
@@ -776,6 +825,7 @@ GAME_HTML = """<!DOCTYPE html>
       <div id="finishTrophy">&#127942;</div>
       <div id="finishWinner"></div>
       <div id="finishYou"></div>
+      <button id="finishResult" style="margin-bottom:10px;padding:12px 28px;font-size:16px;font-family:monospace;background:#258;color:#fff;border:none;border-radius:8px;cursor:pointer">Результаты</button>
       <button id="finishBack">Смотреть поле</button>
     </div>
   </div>
@@ -791,10 +841,12 @@ GAME_HTML = """<!DOCTYPE html>
         <img id="myChip" style="width:54px;height:54px;object-fit:contain;background:#000;border-radius:6px;display:none">
         <div id="who"></div>
       </div>
+      <div id="route" class="label" style="margin:2px 0 6px"></div>
       <div id="players"></div>
       <div id="myturn">
         <button id="nextBtn" class="btn-waiting">Waiting...</button>
       </div>
+      <button id="toResults" style="display:none;margin-top:8px;width:100%;padding:12px;font-size:15px;font-family:monospace;background:#258;color:#fff;border:none;border-radius:8px;cursor:pointer" onclick="window.location.href='/result'">&#127942; Результаты</button>
     </div>
     <img id="feed" src="/stream" alt="Game feed">
   </div>
@@ -870,17 +922,19 @@ GAME_HTML = """<!DOCTYPE html>
       }).catch(() => {});
     }
 
-    let finishDismissed = false;
+    // переход «К игре (поле)» с /result помечается хэшем — сразу показать поле, без оверлея
+    let finishDismissed = (location.hash === '#field');
     document.getElementById('finishBack').onclick = () => {
       finishDismissed = true;
       document.getElementById('finish').style.display = 'none';
     };
+    document.getElementById('finishResult').onclick = () => { window.location.href = '/result'; };
     function showFinish(winner) {
       const f = document.getElementById('finish');
       document.getElementById('finishWinner').textContent =
         (M.game_over || 'Game over') + ': ' + winner;
       document.getElementById('finishYou').textContent =
-        (winner === playerName) ? '🎉 Вы победили!' : 'Вы участвовали в игре';
+        (winner === playerName) ? '🎉 Вы победили!' : 'Спасибо за игру';
       f.style.display = 'flex';
     }
     function hideFinish() { document.getElementById('finish').style.display = 'none'; }
@@ -913,10 +967,16 @@ GAME_HTML = """<!DOCTYPE html>
       }, 5000);
     }
 
+    const ROUTE_NAMES = {linear: 'линейный', snake: 'змейка', spiral: 'спираль'};
     function poll() {
       fetch('/api/game/state').then(r => r.json()).then(data => {
         const s = data.state || {};
         const btn = document.getElementById('nextBtn');
+        // маршрут поля
+        document.getElementById('route').textContent =
+          s.path_type ? 'Маршрут: ' + (ROUTE_NAMES[s.path_type] || s.path_type) : '';
+        // постоянный доступ к результатам, пока партия завершена (даже после закрытия оверлея)
+        document.getElementById('toResults').style.display = (!s.active && s.winner) ? 'block' : 'none';
 
         if (!s.active) {
           // экран финиша поверх всего, если есть победитель и не закрыт игроком
@@ -994,7 +1054,7 @@ GAME_HTML = """<!DOCTYPE html>
         if (!myTurn) {
           setBtn('waiting', M.btn_waiting || 'Waiting for your turn...');
         } else if (!s.ready_for_next) {
-          const target = s.rule_target || s.expected_cell;
+          const target = (s.turn_state === 'AWAITING_RULE') ? s.rule_target : s.expected_cell;
           const moveTpl = M.btn_move_chip || 'Place chip on cell {cell}';
           setBtn('moving', target ? moveTpl.replace('{cell}', target) : moveTpl.replace(' on cell {cell}', ''));
         } else {
@@ -1020,6 +1080,96 @@ GAME_HTML = """<!DOCTYPE html>
     });
 
     init();
+  </script>
+</body>
+</html>
+""".encode("utf-8")
+
+
+RESULT_HTML = """<!DOCTYPE html>
+<html lang="ru">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Результаты</title>
+  <style>
+    * { box-sizing: border-box; margin: 0; padding: 0; }
+    body { font-family: monospace; background: #0c0c0c; color: #ddd; padding: 28px 20px; text-align: center; }
+    #trophy { font-size: 64px; }
+    #winner { font-size: 26px; color: #ffd166; font-weight: bold; margin: 12px 0 4px; }
+    #you { font-size: 17px; color: #4fc; margin-bottom: 22px; }
+    #standings { max-width: 420px; margin: 0 auto 24px; text-align: left; }
+    .prow {
+      display: flex; align-items: center; gap: 10px; padding: 10px 12px;
+      border: 1px solid #333; border-radius: 8px; margin-bottom: 8px; background: #161616;
+    }
+    .prow.win { border-color: #ffd166; background: #1a1606; }
+    .prow.me { box-shadow: 0 0 0 1px #4fc inset; }
+    .rank { font-size: 18px; color: #888; width: 28px; }
+    .prow img { width: 40px; height: 40px; object-fit: contain; background: #000; border-radius: 6px; }
+    .pname { color: #4fc; font-weight: bold; }
+    .pchip { color: #ffd166; font-size: 13px; }
+    .pcell { margin-left: auto; color: #fc4; }
+    .meTag { color: #ff9; font-size: 12px; }
+    #back {
+      padding: 12px 28px; font-size: 16px; font-family: monospace;
+      background: #2a6; color: #fff; border: none; border-radius: 8px; cursor: pointer;
+    }
+    #empty { color: #777; font-size: 15px; margin: 30px 0; }
+  </style>
+</head>
+<body>
+  <div id="trophy">&#127942;</div>
+  <div id="winner"></div>
+  <div id="you"></div>
+  <div id="standings"></div>
+  <div id="empty" style="display:none">Результатов пока нет — игра не завершена.</div>
+  <div id="resultBtns" style="display:flex;gap:10px;justify-content:center;flex-wrap:wrap">
+    <button id="finishScreen" style="display:none;padding:12px 24px;font-size:16px;font-family:monospace;background:#258;color:#fff;border:none;border-radius:8px;cursor:pointer" onclick="window.location.href='/game'">&#127942; Экран завершения</button>
+    <button id="back" onclick="window.location.href='/game#field'">&larr; К игре (поле)</button>
+  </div>
+  <script>
+    let M = {};
+    const playerName = localStorage.getItem('playerName');
+    fetch('/api/messages').then(r => r.json()).then(d => { M = d.messages || {}; }).catch(() => {});
+
+    function render() {
+      fetch('/api/game/state').then(r => r.json()).then(data => {
+        const s = data.state || {};
+        // страница активна, пока есть завершённое состояние (есть победитель и игра не идёт)
+        if (s.active) { window.location.href = '/game'; return; }
+        if (!s.winner) {
+          document.getElementById('winner').textContent = '';
+          document.getElementById('you').textContent = '';
+          document.getElementById('standings').innerHTML = '';
+          document.getElementById('empty').style.display = 'block';
+          document.getElementById('trophy').style.display = 'none';
+          document.getElementById('finishScreen').style.display = 'none';
+          return;
+        }
+        document.getElementById('empty').style.display = 'none';
+        document.getElementById('trophy').style.display = '';
+        document.getElementById('finishScreen').style.display = '';
+        document.getElementById('winner').textContent = (M.game_over || 'Победитель') + ': ' + s.winner;
+        document.getElementById('you').textContent =
+          (s.winner === playerName) ? '🎉 Вы победили!' : (playerName ? 'Вы: ' + playerName : '');
+        // финальная таблица — по клетке (дальше прошёл = выше)
+        const players = (s.players || []).slice().sort((a, b) => (b.cell||0) - (a.cell||0));
+        document.getElementById('standings').innerHTML = players.map((p, i) => {
+          const win = p.name === s.winner ? ' win' : '';
+          const me = p.name === playerName ? ' me' : '';
+          const meTag = p.name === playerName ? ' <span class="meTag">[вы]</span>' : '';
+          return '<div class="prow' + win + me + '">' +
+            '<span class="rank">' + (i + 1) + '</span>' +
+            '<img src="/api/chips/' + p.chip_id + '/image" onerror="this.style.visibility=\\'hidden\\'">' +
+            '<span class="pname">' + p.name + '</span>' + meTag +
+            ' <span class="pchip">' + (p.chip_name || '') + '</span>' +
+            '<span class="pcell">' + (M.cell_label || 'клетка') + ' ' + p.cell + '</span></div>';
+        }).join('');
+      }).catch(() => {});
+    }
+    render();
+    setInterval(render, 1500);
   </script>
 </body>
 </html>

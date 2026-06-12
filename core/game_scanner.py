@@ -126,6 +126,7 @@ class GameScanner:
             "dice_roll": self.engine._last_dice_roll,
             "board_size": self.engine.state.board_size,
             "winner": winner.name if winner else None,
+            "path_type": self.field.path_type,
             "current_turn": dict(turn_entry) if turn_entry else None,
             "ready_for_next": self.engine.is_active and self.engine.can_advance(),
             "players": [
@@ -230,6 +231,24 @@ class GameScanner:
         self.http_server.emit_event("NOTICE", {"message": f"Поле откалибровано: {cols}×{rows}", "level": "info"})
         self._sync_http_game_state()
 
+    def _set_path_from_web(self, ptype: str) -> None:
+        """Сменить порядок обхода клеток (linear/snake/spiral) из веб-админа."""
+        if self.engine.is_active:
+            msg = "Нельзя менять маршрут во время партии. Остановите партию ([Стоп])."
+            self._log(f"⚠️ {msg}")
+            self.http_server.emit_event("NOTICE", {"message": msg, "level": "error"})
+            return
+        if not self.field.is_calibrated():
+            msg = "Сначала откалибруйте поле, затем меняйте маршрут."
+            self._log(f"⚠️ {msg}")
+            self.http_server.emit_event("NOTICE", {"message": msg, "level": "error"})
+            return
+        self.field.set_path_type(ptype)
+        self.field.save("items/field_calibration.json")
+        self._log(f"МАРШРУТ [HTTP]: порядок клеток → {ptype}")
+        self.http_server.emit_event("NOTICE", {"message": f"Маршрут поля: {ptype}", "level": "info"})
+        self._sync_http_game_state()
+
     def _remove_player_by_value(self, value: str) -> None:
         """Удалить игрока из очереди по имени/номеру (для веб-админа). Синхронизирует движок."""
         chip_id = self.turns.remove(value)
@@ -256,6 +275,9 @@ class GameScanner:
         """Отправить событие GameEngine в HTTP сервер"""
         if event:
             self.http_server.emit_event(event.type, event.data)
+            # Лог значимых игровых событий в stdout (для анализа игрового цикла, раздел 4.4)
+            if event.type in ("TURN_START", "RULE_TRIGGERED", "GAME_OVER", "CHIP_MOVED"):
+                self._log(f"EVENT {event.type}: {event.data}")
             self._sync_http_game_state()
 
     def _start_turn_profile(self, chip_id: str, player_name: str, target_cell: int, phase: str) -> None:
@@ -1296,11 +1318,13 @@ class GameScanner:
 
             # Визуализация
             display_frame = frame.copy()
-            if self._grid_visible:
-                self.field.draw_grid(display_frame)
-                self.field.draw_cell_fills(display_frame, self._build_cell_colors(),
-                                           settings.CELL_FILL_ALPHA)
-                self.field.draw_cell_numbers(display_frame, settings.CELL_NUMBER_COLOR)
+            with (p.measure('field') if p else nullcontext()):
+                if self._grid_visible:
+                    self.field.draw_grid(display_frame)
+                    self.field.draw_cell_fills(display_frame, self._build_cell_colors(),
+                                               settings.CELL_FILL_ALPHA)
+                    self.field.draw_cell_numbers(display_frame, settings.CELL_NUMBER_COLOR,
+                                                 settings.CELL_NUMBER_POSITION)
 
             if des_frame is not None and len(des_frame) > 0:
                 # Получение всех зарегистрированных объектов
@@ -1429,8 +1453,11 @@ class GameScanner:
                         # Вывод в консоль (опционально, можно отключить для производительности)
                         # print(f"Объект '{object_name}' (ID: {object_id[:8]}...) найден! Центр: {center}, Уверенность: {confidence:.2f}")
             
-            # Стартовое сообщение (первые 5 секунд, только когда нет активного хода)
-            if ((datetime.datetime.now() - start_time).total_seconds() < 5.0
+            # Стартовое сообщение (первые 5 секунд, только когда нет активного хода).
+            # Игровые тексты дублируются в вебе через API, поэтому в кадр пишем
+            # их только при включённом оверлее cv2 (settings.CV2_SHOW_OVERLAY).
+            if (settings.CV2_SHOW_OVERLAY
+                    and (datetime.datetime.now() - start_time).total_seconds() < 5.0
                     and not self.turns.is_focused()
                     and not self._calibration_mode
                     and not self.registration_mode):
@@ -1450,32 +1477,34 @@ class GameScanner:
                     self._putText_stroked(display_frame, labels_short[i], (pt[0] + 10, pt[1] - 6),
                                 cv2.FONT_HERSHEY_SIMPLEX, 0.55, (255, 200, 0), 2)
 
-            # Победитель / готовность / текущий ход
-            if self.engine.state.winner:
-                self._putText_stroked(
-                    display_frame,
-                    f"GAME OVER — {self.engine.state.winner.name} wins!",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 100), 2
-                )
-            elif self.engine.is_active and not self.turns.current():
-                self._putText_stroked(
-                    display_frame,
-                    "GAME READY — press [N] or Next Turn",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 100), 2
-                )
-            # Информация о текущем ходе + статус FSM
-            elif turn_entry := self.turns.current():
-                self._putText_stroked(
-                    display_frame,
-                    f"TURN: {turn_entry['player']}  [{turn_entry['chip_name']}]",
-                    (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2
-                )
-                fsm = self.engine.status_msg()
-                if fsm:
+            # Победитель / готовность / текущий ход — игровые тексты в кадре только при
+            # включённом оверлее cv2; в веб-интерфейс та же информация идёт через API.
+            if settings.CV2_SHOW_OVERLAY:
+                if self.engine.state.winner:
                     self._putText_stroked(
-                        display_frame, fsm[0],
-                        (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, fsm[1], 2
+                        display_frame,
+                        f"GAME OVER — {self.engine.state.winner.name} wins!",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.75, (0, 255, 100), 2
                     )
+                elif self.engine.is_active and not self.turns.current():
+                    self._putText_stroked(
+                        display_frame,
+                        "GAME READY — press [N] or Next Turn",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 255, 100), 2
+                    )
+                # Информация о текущем ходе + статус FSM
+                elif turn_entry := self.turns.current():
+                    self._putText_stroked(
+                        display_frame,
+                        f"TURN: {turn_entry['player']}  [{turn_entry['chip_name']}]",
+                        (10, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.65, (0, 200, 255), 2
+                    )
+                    fsm = self.engine.status_msg()
+                    if fsm:
+                        self._putText_stroked(
+                            display_frame, fsm[0],
+                            (10, 58), cv2.FONT_HERSHEY_SIMPLEX, 0.55, fsm[1], 2
+                        )
 
             # Информация о режиме регистрации
             if self.registration_mode:
@@ -1500,16 +1529,18 @@ class GameScanner:
 
             with (p.measure('draw') if p else nullcontext()):
                 self._draw_ui(display_frame)
-            if self._display_scale != 1.0:
-                dw = int(display_frame.shape[1] * self._display_scale)
-                dh = int(display_frame.shape[0] * self._display_scale)
-                display_frame = cv2.resize(display_frame, (dw, dh))
-            cv2.imshow(settings.WINDOW_NAME, display_frame)
-            self.metrics.render()
+            with (p.measure('show') if p else nullcontext()):
+                if self._display_scale != 1.0:
+                    dw = int(display_frame.shape[1] * self._display_scale)
+                    dh = int(display_frame.shape[0] * self._display_scale)
+                    display_frame = cv2.resize(display_frame, (dw, dh))
+                cv2.imshow(settings.WINDOW_NAME, display_frame)
+                self.metrics.render()
 
             # Кадр → MJPEG стрим (encode после resize чтобы слать уменьшенный кадр)
-            _, jpeg = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
-            self.http_server.update_stream_frame(jpeg.tobytes())
+            with (p.measure('mjpeg') if p else nullcontext()):
+                _, jpeg = cv2.imencode('.jpg', display_frame, [cv2.IMWRITE_JPEG_QUALITY, 60])
+                self.http_server.update_stream_frame(jpeg.tobytes())
 
             # HTTP команды → эмуляция клавиши (приоритет ниже реальной клавиши)
             for cmd in self.http_server.drain_commands():
@@ -1525,6 +1556,10 @@ class GameScanner:
                     self._pending_key = ord('q')
                 elif cmd == "endgame":
                     self._end_game()
+                elif cmd == "overlay":
+                    settings.CV2_SHOW_OVERLAY = not settings.CV2_SHOW_OVERLAY
+                    state = "видна" if settings.CV2_SHOW_OVERLAY else "скрыта"
+                    self._log(f"Панель команд cv2: {state}")
 
             # HTTP админ-команды (удаление фишки / игрока, калибровка)
             for acmd in self.http_server.drain_admin():
@@ -1534,6 +1569,8 @@ class GameScanner:
                     self._remove_player_by_value(acmd["value"])
                 elif acmd["action"] == "calibrate":
                     self._calibrate_from_web(acmd["corners"], acmd["cols"], acmd["rows"], frame)
+                elif acmd["action"] == "set_path":
+                    self._set_path_from_web(acmd["value"])
 
             # HTTP веб-регистрация
             for cmd in self.http_server.drain_register_commands():
@@ -1600,6 +1637,7 @@ class GameScanner:
                 self._pending_key = None
 
             if p:
+                p.set_counts(total_registered, active_count)
                 p.next_frame()
             if self._handle_key(key):
                 break
@@ -1610,6 +1648,12 @@ class GameScanner:
     
     def shutdown(self):
         """Корректное завершение работы системы"""
+        # Сводка качества детекции за сессию (раздел 4.2)
+        for line in self.metrics.session_summary():
+            self._log(line)
+        # Сводка разбивки времени по операциям (раздел 4.3)
+        if self.profiler:
+            self.profiler._print_summary()
         self._log("SESSION END")
         self.running = False
         self.http_server.stop()

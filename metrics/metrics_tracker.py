@@ -6,7 +6,7 @@
 import cv2
 import numpy as np
 import time
-from collections import deque
+from collections import deque, defaultdict
 
 
 class MetricsTracker:
@@ -20,6 +20,10 @@ class MetricsTracker:
         self.registered_count: int = 0
         self.detections: list = []  # [{name, conf, matches}]
         self.active_objects: list = []  # [{name, cell}]
+        # Накопительная статистика детекции за сессию (для раздела 4.2)
+        self._detect_frames: int = 0                    # кадров с этапом детекции
+        self._chip_frames: dict = defaultdict(int)      # фишка → в скольких кадрах обнаружена
+        self._chip_matches: dict = defaultdict(list)    # фишка → список matches_count
 
     def tick(self) -> float:
         """Отметить начало кадра. Возвращает время старта для record_proc."""
@@ -38,6 +42,26 @@ class MetricsTracker:
             {"name": d["object_name"], "conf": d["confidence"], "matches": d["matches_count"]}
             for d in detections
         ]
+        # Накопление статистики за сессию
+        self._detect_frames += 1
+        for d in detections:
+            self._chip_frames[d["object_name"]] += 1
+            self._chip_matches[d["object_name"]].append(d["matches_count"])
+
+    def session_summary(self) -> list[str]:
+        """Сводка качества детекции за сессию (строки для лога, раздел 4.2)."""
+        lines = [f"=== DETECTION SUMMARY: кадров с детекцией={self._detect_frames} ==="]
+        if not self._chip_frames:
+            lines.append("  (детекций не было)")
+            return lines
+        for name in sorted(self._chip_frames):
+            frames = self._chip_frames[name]
+            pct = frames / self._detect_frames * 100 if self._detect_frames else 0
+            matches = self._chip_matches[name]
+            avg_m = sum(matches) / len(matches) if matches else 0
+            lines.append(f"  {name}: обнаружена в {frames} кадрах ({pct:.0f}%), "
+                         f"среднее совпадений={avg_m:.0f}")
+        return lines
 
     def update_active_objects(self, active_objects: list):
         self.active_objects = active_objects

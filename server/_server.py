@@ -5,7 +5,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 from server._state import _State
-from server._pages import ADMIN_HTML, JOIN_HTML, GAME_HTML
+from server._pages import ADMIN_HTML, JOIN_HTML, GAME_HTML, RESULT_HTML
 from server import _net
 from config import settings
 from config import messages as _msg_module
@@ -20,6 +20,8 @@ class GameEventHandler(BaseHTTPRequestHandler):
             self._send(JOIN_HTML, "text/html; charset=utf-8")
         elif self.path == "/game":
             self._send(GAME_HTML, "text/html; charset=utf-8")
+        elif self.path == "/result":
+            self._send(RESULT_HTML, "text/html; charset=utf-8")
         elif self.path == "/stream":
             self._mjpeg_stream()
         elif self.path == "/api/chips":
@@ -64,6 +66,11 @@ class GameEventHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/game/grid":
             _State.command_queue.put("grid")
             self._json({"status": "queued"})
+        elif self.path == "/api/game/overlay":
+            _State.command_queue.put("overlay")
+            self._json({"status": "queued"})
+        elif self.path == "/api/game/path":
+            self._handle_set_path()
         elif self.path == "/api/game/endgame":
             _State.command_queue.put("endgame")
             self._json({"status": "queued"})
@@ -123,6 +130,21 @@ class GameEventHandler(BaseHTTPRequestHandler):
             self._json({"error": "bad request"}, 400)
             return
         self._json({"ok": pw == settings.ADMIN_PASSWORD})
+
+    def _handle_set_path(self):
+        """Сменить порядок обхода клеток поля (linear/snake/spiral)."""
+        try:
+            length = int(self.headers.get("Content-Length", 0))
+            body = json.loads(self.rfile.read(length))
+            ptype = str(body.get("type", "")).strip()
+        except Exception:
+            self._json({"error": "bad request"}, 400)
+            return
+        if ptype not in ("linear", "snake", "spiral"):
+            self._json({"error": "type must be linear/snake/spiral"}, 400)
+            return
+        _State.admin_queue.put({"action": "set_path", "value": ptype})
+        self._json({"status": "queued"})
 
     def _handle_calibrate(self):
         """Калибровка поля по 4 нормированным углам + размер сетки."""
@@ -216,12 +238,17 @@ class GameEventHandler(BaseHTTPRequestHandler):
         self.send_header("Access-Control-Allow-Headers", "Content-Type")
 
     def _send(self, body: bytes, content_type: str, code: int = 200):
-        self.send_response(code)
-        self.send_header("Content-Type", content_type)
-        self.send_header("Content-Length", str(len(body)))
-        self._cors()
-        self.end_headers()
-        self.wfile.write(body)
+        # Клиент (вкладка браузера) может закрыть соединение во время ответа —
+        # это нормально для polling/стрима, глушим шумную трассировку.
+        try:
+            self.send_response(code)
+            self.send_header("Content-Type", content_type)
+            self.send_header("Content-Length", str(len(body)))
+            self._cors()
+            self.end_headers()
+            self.wfile.write(body)
+        except (ConnectionAbortedError, ConnectionResetError, BrokenPipeError):
+            pass
 
     def _json(self, data: dict, code: int = 200):
         self._send(json.dumps(data).encode(), "application/json", code)

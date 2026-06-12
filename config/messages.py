@@ -8,7 +8,7 @@ MESSAGES = {
         # Статус хода (строка Turn в /game)
         'turn_prefix':        'Ход',
         'game_ready':         'Игра готова — нажмите следующий ход',
-        'game_over':          'Игра окончена',
+        'game_over':          'Игра окончена, победитель',
         'game_not_started':   'Игра не начата',
 
         # Состояния FSM (строка под ходом, если игра активна)
@@ -68,7 +68,7 @@ MESSAGES = {
     'en': {
         'turn_prefix':      'Turn',
         'game_ready':       'Game ready — press Next Turn',
-        'game_over':        'Game over',
+        'game_over':        'Game over, winner is',
         'game_not_started': 'Game not started',
 
         'waiting_move':  'Dice: {dice} → cell {cell}',
