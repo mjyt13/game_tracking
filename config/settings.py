@@ -8,7 +8,7 @@ CAMERA_PRIMARY = 'usb'
 
 CAMERA_RTSP_URL = 'rtsp://192.168.0.102:8080/h264_ulaw.sdp'  # IP Webcam (Android)
 CAMERA_HTTP_URL = 'http://192.168.0.102:4747/video'           # DroidCam HTTP
-CAMERA_USB_INDEX = 2  # 0 — встроенная, 1 — DroidCam USB, 2 — OBS Virtual Camera
+CAMERA_USB_INDEX = 0  # 0 — встроенная, 1 — DroidCam USB, 2 — OBS Virtual Camera
 
 # Разрешение и fps USB-камеры (реальная пропускная способность USB 2.0 ~480 Мбит/с):
 #   MJPG выкл, 1920×1080 → ~1 fps   (raw YUY2, ~6 Гбит/с — не влезает)
@@ -95,7 +95,7 @@ TRACKER_INACTIVE_FRAMES = 8    # кадров без детекции до DISAP
 
 # HSV-верификация цвета (постфильтр после SIFT — отклоняет ложные детекции по цвету)
 # Требует перерегистрации фишек для записи hsv_profile в память
-HSV_VERIFICATION = False   # включить/отключить
+HSV_VERIFICATION = True   # включить/отключить
 HSV_CROP_RATIO   = 0.3    # 0.5 = берём центральные 50% bbox по каждой оси (25% площади)
                           # 0.3 = центральные 30% bbox по каждой оси (9% площади)
 HSV_H_TOLERANCE  = 20     # допуск по оттенку (0–179, с учётом цикличности красного)
@@ -119,6 +119,17 @@ ALLOW_SINGLE_PLAYER = False  # False → старт игры требует 2+ �
 
 # Настройки UI
 WINDOW_NAME = 'Game Field'
+# Безголовый режим (дек/сервер): не создавать окна OpenCV, работать только через веб.
+# Полезно с opencv-python-headless. Камера всё равно опциональна — без неё идёт симуляция.
+HEADLESS = False
+
+# Разрешить форсирование ходов (симуляция) кнопками в админке/кабине пилота.
+# Независимо от HEADLESS; в безголовом режиме и без камеры включается автоматически.
+SIMULATION_ENABLED = False
+
+# Папка с записанными видео для страницы /video (отдаёт любые .mp4 с поддержкой Range).
+# Тяжёлые ролики можно держать вне git и указать сюда свой путь.
+VIDEO_DIR = "docs/images"
 DISPLAY_FPS = True
 DISPLAY_SCALE = 0.75  # Масштаб окна отображения; обработка всегда на полном разрешении
 CV2_SHOW_OVERLAY = False  # Показывать в окне cv2 панель команд и кнопки управления

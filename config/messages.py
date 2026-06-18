@@ -31,6 +31,7 @@ MESSAGES = {
 
         # Уведомления о правилах клеток
         'rule_skip_turn':    'Ход пропущен!',
+        'rule_extra_turn':   'Дополнительный ход!',
         'rule_move_forward': 'Вперёд на {distance} клеток!',
         'rule_move_back':    'Назад на {distance} клеток!',
         'rule_finish':       'Финиш!',
@@ -87,6 +88,7 @@ MESSAGES = {
         'you_label':  '[you]',
 
         'rule_skip_turn':    'Turn skipped!',
+        'rule_extra_turn':   'Extra turn!',
         'rule_move_forward': 'Move forward {distance} cells!',
         'rule_move_back':    'Move back {distance} cells!',
         'rule_finish':       'Reached the finish!',

@@ -103,6 +103,10 @@ ADMIN_HTML = """<!DOCTYPE html>
     <input id="loginPw" type="password" placeholder="Пароль" autocomplete="current-password">
     <button onclick="doLogin()">Войти</button>
     <div id="loginErr"></div>
+    <hr style="width:240px;border:none;border-top:1px solid #333;margin:18px 0">
+    <a href="/video" style="color:#4af;text-decoration:none">Записи игр</a>
+    <a href="/pilot" style="color:#4af;text-decoration:none;margin-top:8px">Кабина пилота (демо)</a>
+    <div style="margin-top:6px;color:#555;font-size:12px">или войдите с пустым паролем</div>
   </div>
   <div id="notification"></div>
   <button id="panelToggle" onclick="togglePanel()">Скрыть панель</button>
@@ -133,6 +137,9 @@ ADMIN_HTML = """<!DOCTYPE html>
         <button data-act="start" id="startBtn" class="go">&#9654;&#9654; Старт игры</button>
         <button data-act="next" class="go">&#9654; Следующий ход</button>
         <button data-act="endgame">&#9632; Стоп партии</button>
+        <button data-act="sim_toggle" id="simToggle">Симуляция: выкл</button>
+        <button data-act="sim_step" id="simStep" style="display:none">Шаг симуляции</button>
+        <button data-act="sim_auto" id="simAuto" style="display:none">Доиграть автоматически</button>
       </div>
       <div class="col">
         <div class="ch">Система</div>
@@ -174,6 +181,7 @@ ADMIN_HTML = """<!DOCTYPE html>
     }
     function doLogin() {
       const pw = document.getElementById('loginPw').value;
+      if (pw === '') { window.location.href = '/pilot'; return; }  // пустой пароль → кабина пилота
       fetch('/api/admin/login', {
         method: 'POST', headers: {'Content-Type': 'application/json'},
         body: JSON.stringify({password: pw})
@@ -260,6 +268,9 @@ ADMIN_HTML = """<!DOCTYPE html>
       else if (act === 'overlay') { cmd('overlay'); }
       else if (act === 'endgame') { if (confirm('Остановить текущую партию?')) cmd('endgame'); }
       else if (act === 'stop') { if (confirm('Выключить систему и сервер? Веб перестанет работать.')) cmd('stop'); }
+      else if (act === 'sim_toggle') { cmd('sim_toggle'); }
+      else if (act === 'sim_step') { cmd('sim_step'); }
+      else if (act === 'sim_auto') { cmd('sim_auto'); }
       else if (act === 'calibrate') { openCalibrate(); }
       else if (act === 'list') { openGallery(false); }
       else if (act === 'delete') { openGallery(true); }
@@ -359,6 +370,13 @@ ADMIN_HTML = """<!DOCTYPE html>
     function update() {
       fetch('/api/game/state').then(r => r.json()).then(data => {
         const s = data.state || {};
+        // тумблер симуляции: статус + показ кнопок форсирования хода
+        const se = !!s.sim_enabled;
+        const stog = document.getElementById('simToggle');
+        if (stog) stog.textContent = 'Симуляция: ' + (se ? 'вкл' : 'выкл');
+        const ssEl = document.getElementById('simStep'), saEl = document.getElementById('simAuto');
+        if (ssEl) ssEl.style.display = se ? '' : 'none';
+        if (saEl) saEl.style.display = se ? '' : 'none';
         // отразить реальный маршрут поля в выпадающем списке (не мешая выбору пользователя)
         const psel = document.getElementById('pathSel');
         if (s.path_type && psel && document.activeElement !== psel && psel.value !== s.path_type) {
@@ -845,6 +863,7 @@ GAME_HTML = """<!DOCTYPE html>
       <div id="players"></div>
       <div id="myturn">
         <button id="nextBtn" class="btn-waiting">Waiting...</button>
+        <button id="simBtn" style="display:none;margin-top:8px;width:100%;padding:12px;font-size:15px;font-family:monospace;background:#2f855a;color:#fff;border:none;border-radius:8px;cursor:pointer" onclick="simStep()">Пройти</button>
       </div>
       <button id="toResults" style="display:none;margin-top:8px;width:100%;padding:12px;font-size:15px;font-family:monospace;background:#258;color:#fff;border:none;border-radius:8px;cursor:pointer" onclick="window.location.href='/result'">&#127942; Результаты</button>
     </div>
@@ -868,6 +887,7 @@ GAME_HTML = """<!DOCTYPE html>
       const d = data.distance || '';
       const map = {
         'SKIP_TURN':    () => M.rule_skip_turn || 'Turn skipped!',
+        'EXTRA_TURN':   () => M.rule_extra_turn || 'Extra turn!',
         'MOVE_FORWARD': () => (M.rule_move_forward || 'Forward {distance}!').replace('{distance}', d),
         'MOVE_BACK':    () => (M.rule_move_back || 'Back {distance}!').replace('{distance}', d),
         'FINISH':       () => M.rule_finish || 'Finish!',
@@ -1003,12 +1023,16 @@ GAME_HTML = """<!DOCTYPE html>
           }).join('');
           document.getElementById('players').innerHTML = roster;
           setBtn('waiting', M.btn_game_not_started || 'Waiting...');
+          var _sb0 = document.getElementById('simBtn'); if (_sb0) _sb0.style.display = 'none';
           return;
         }
 
         // игра активна — сбросить экран финиша (для следующей партии)
         finishDismissed = false;
         hideFinish();
+        // кнопка «Пройти» — доступна всем игрокам при включённой симуляции
+        var _sb = document.getElementById('simBtn');
+        if (_sb) _sb.style.display = s.sim_enabled ? 'block' : 'none';
 
         // Player column
         const myPlayer = (s.players || []).find(p => p.name === playerName);
@@ -1072,6 +1096,9 @@ GAME_HTML = """<!DOCTYPE html>
 
     function next() {
       fetch('/api/game/next', { method: 'POST' }).catch(() => {});
+    }
+    function simStep() {
+      fetch('/api/game/sim_step', { method: 'POST' }).catch(() => {});
     }
 
     document.getElementById('nextBtn').onclick = next;
@@ -1174,3 +1201,24 @@ RESULT_HTML = """<!DOCTYPE html>
 </body>
 </html>
 """.encode("utf-8")
+
+
+_PILOT_GUARD = b"""<script>
+/* pilot cabinet: auto-login and neutralize destructive actions */
+(function(){
+  var orig = window.fetch;
+  var blocked = ['/api/game/stop','/api/chips/delete','/api/players/remove','/api/register/start','/api/register/shot','/api/register/cancel'];
+  window.fetch = function(u){
+    if (typeof u === 'string' && blocked.some(function(b){ return u.indexOf(b) === 0; }))
+      return Promise.resolve(new Response('{"status":"disabled"}', {status:200, headers:{'Content-Type':'application/json'}}));
+    return orig.apply(this, arguments);
+  };
+  window.addEventListener('DOMContentLoaded', function(){
+    var lg = document.getElementById('login'); if (lg) lg.style.display = 'none';
+  });
+})();
+</script>"""
+
+# Кабина пилота: тот же UI, что и админка, но без логина и с обезвреженными
+# опасными действиями (выключение, удаление фишек/игроков, регистрация).
+PILOT_HTML = ADMIN_HTML.replace(b"<body>", b"<body>" + _PILOT_GUARD, 1)

@@ -39,6 +39,8 @@ class GameScanner:
         """Инициализация всех компонентов системы"""
         # Компоненты системы
         self.camera = CameraManager()
+        self._no_camera = False        # режим без камеры (гибрид): кадр-заглушка, игра идёт от симуляции
+        self._placeholder = None
         self.feature_extractor = FeatureExtractor()
         self.object_detector = ObjectDetector()
         self.storage = FeatureStorage()
@@ -129,6 +131,7 @@ class GameScanner:
             "path_type": self.field.path_type,
             "current_turn": dict(turn_entry) if turn_entry else None,
             "ready_for_next": self.engine.is_active and self.engine.can_advance(),
+            "sim_enabled": settings.SIMULATION_ENABLED,
             "players": [
                 {
                     "name": p.name,
@@ -332,6 +335,81 @@ class GameScanner:
             self._start_turn_profile(chip_id, profile["player"], self.engine.rule_target, "AWAITING_RULE")
         else:
             self._turn_profile = None
+
+    def _advance_turn(self) -> bool:
+        """Передать ход следующему игроку (или выдать экстра-ход). True если ход начат.
+        Вызывается из [N] и из симуляции."""
+        if self.engine._pending_extra_turn:
+            chip_id = self.engine._pending_extra_turn
+            self.engine._pending_extra_turn = None
+            self._log("EXTRA_TURN: игрок получает ещё один ход")
+            event = self.engine.begin_turn(chip_id)
+            self._forward_engine_event(event)
+            player = self.engine.state.get_player(chip_id)
+            if player:
+                self._start_turn_profile(chip_id, player.name, self.engine.expected_cell, self.engine.turn_state)
+            self._chip_cells.pop(chip_id, None)
+            self._chip_cell_debounce.pop(chip_id, None)
+            return True
+        entry = self.turns.advance()
+        if not entry:
+            print("⚠️ Очередь пуста. Добавьте игроков через [T].")
+            return False
+        self._log(f"ХОД: '{entry['player']}' → фишка '{entry['chip_name']}'")
+        if self.engine.is_active:
+            event = self.engine.begin_turn(entry["chip_id"])
+            self._forward_engine_event(event)
+            self._start_turn_profile(
+                entry["chip_id"], entry["player"], self.engine.expected_cell, self.engine.turn_state
+            )
+            self._chip_cells.pop(entry["chip_id"], None)
+            self._chip_cell_debounce.pop(entry["chip_id"], None)
+        return True
+
+    def _simulate_step(self) -> bool:
+        """Один шаг симуляции: продвинуть FSM без физической детекции.
+        IDLE/TURN_DONE → следующий ход; WAITING_MOVE/AWAITING_RULE → «фишка дошла до целевой клетки»."""
+        if not settings.SIMULATION_ENABLED:
+            return False
+        if not self.engine.is_active:
+            return False
+        st = self.engine.turn_state
+        if st in ("IDLE", "TURN_DONE"):
+            if not self.engine.can_advance():
+                return False
+            started = self._advance_turn()
+            self._sync_http_game_state()
+            return started
+        chip = self.engine._active_chip_id
+        if chip is None:
+            return False
+        if st == "WAITING_MOVE":
+            target = self.engine.expected_cell
+        elif st == "AWAITING_RULE":
+            target = self.engine.rule_target
+        else:
+            return False
+        accepted_state = self.engine.turn_state
+        events = self.engine.on_chip_at_cell(chip, target)
+        for event in events:
+            self._forward_engine_event(event)
+        if events:
+            self._chip_cells[chip] = target
+            self._finish_turn_profile(chip, target, accepted_state)
+        self._sync_http_game_state()
+        return bool(events)
+
+    def _simulate_auto(self) -> None:
+        """Автопрогон партии до победителя без детекции (с предохранителем от зацикливания)."""
+        if not settings.SIMULATION_ENABLED:
+            return
+        self._log("СИМУЛЯЦИЯ: автопрогон партии")
+        for _ in range(1000):
+            if not self.engine.is_active:
+                break
+            if not self._simulate_step():
+                break
+        self._sync_http_game_state()
 
     def _log_pre_game_summary(self) -> None:
         """Показать сводку перед стартом, не двигая очередь ходов."""
@@ -1063,35 +1141,7 @@ class GameScanner:
                 print("⚠️ Дождитесь выполнения хода перед передачей очереди.")
                 return False
 
-            # Проверить, есть ли ожидающий EXTRA_TURN для текущего игрока
-            if self.engine._pending_extra_turn:
-                chip_id = self.engine._pending_extra_turn
-                self.engine._pending_extra_turn = None
-                self._log(f"EXTRA_TURN: игрок получает ещё один ход")
-                event = self.engine.begin_turn(chip_id)
-                self._forward_engine_event(event)
-                player = self.engine.state.get_player(chip_id)
-                if player:
-                    self._start_turn_profile(chip_id, player.name, self.engine.expected_cell, self.engine.turn_state)
-                # сброс состояния текущего хода для экстра-хода
-                self._chip_cells.pop(chip_id, None)
-                self._chip_cell_debounce.pop(chip_id, None)
-            else:
-                entry = self.turns.advance()
-                if entry:
-                    self._log(f"ХОД: '{entry['player']}' → фишка '{entry['chip_name']}'")
-                    if self.engine.is_active:
-                        event = self.engine.begin_turn(entry["chip_id"])
-                        self._forward_engine_event(event)
-                        self._start_turn_profile(
-                            entry["chip_id"], entry["player"], self.engine.expected_cell, self.engine.turn_state
-                        )
-                        # сброс клетки активной фишки — иначе begin_turn пропустит уже известную позицию
-                        self._chip_cells.pop(entry["chip_id"], None)
-                        # сброс дебаунса — новый ход начинается с чистого листа
-                        self._chip_cell_debounce.pop(entry["chip_id"], None)
-                else:
-                    print("⚠️ Очередь пуста. Добавьте игроков через [T].")
+            self._advance_turn()
         elif key == ord('a'):
             self.turns.unfocus()
             self._log("Режим: все фишки")
@@ -1252,13 +1302,26 @@ class GameScanner:
                 print(f"❌ Ожидается 'ШxВ' (например, 8x5), получено: '{value}'.")
             self._calibration_corners = []
 
+    def _get_placeholder(self):
+        """Кадр-заглушка для режима без камеры (создаётся один раз)."""
+        if self._placeholder is None:
+            f = np.zeros((settings.CAMERA_HEIGHT, settings.CAMERA_WIDTH, 3), dtype=np.uint8)
+            f[:] = (35, 35, 40)
+            cv2.putText(f, "No camera - simulation mode",
+                        (40, settings.CAMERA_HEIGHT // 2), cv2.FONT_HERSHEY_SIMPLEX,
+                        1.0, (200, 200, 200), 2, cv2.LINE_AA)
+            self._placeholder = f
+        return self._placeholder.copy()
+
     def tracking_loop(self):
         """Главный цикл трекинга и обработки кадров"""
         # Инициализация камеры
         self._log(f"СТАРТ системы  детектор={settings.DETECTOR_TYPE}  память={settings.FEATURE_MEMORY_FILE}")
         if not self.camera.initialize():
-            self._log("ОШИБКА: не удалось инициализировать камеру")
-            return
+            self._no_camera = True
+            self._log("Камера недоступна — режим без камеры (веб + симуляция)")
+        if settings.HEADLESS or self._no_camera:
+            settings.SIMULATION_ENABLED = True  # без камеры ход двигается только симуляцией
         
         # Загрузка калибровки поля (если есть)
         field_info = ""
@@ -1267,9 +1330,10 @@ class GameScanner:
 
         self._log(f"SESSION START - detector: {settings.DETECTOR_TYPE}, SIFT: {settings.SIFT_FEATURES}{field_info}")
 
-        # Создание окна и привязка обработчика мыши
-        cv2.namedWindow(settings.WINDOW_NAME)
-        cv2.setMouseCallback(settings.WINDOW_NAME, self._mouse_callback, self.mouse_handler_params)
+        # Создание окна и привязка обработчика мыши (в headless GUI нет)
+        if not settings.HEADLESS:
+            cv2.namedWindow(settings.WINDOW_NAME)
+            cv2.setMouseCallback(settings.WINDOW_NAME, self._mouse_callback, self.mouse_handler_params)
         
         self.running = True
         frame_count = 0
@@ -1281,10 +1345,14 @@ class GameScanner:
             # Чтение кадра
             p = self.profiler
             with (p.measure('camera') if p else nullcontext()):
-                ret, frame = self.camera.read_frame()
+                if self._no_camera:
+                    ret, frame = True, self._get_placeholder()
+                else:
+                    ret, frame = self.camera.read_frame()
             if not ret:
-                print("⚠️ Не удалось прочитать кадр. Выход.")
-                break
+                # камера отвалилась на ходу — продолжаем по заглушке, не выходим
+                self._no_camera = True
+                ret, frame = True, self._get_placeholder()
 
             frame_count += 1
             self.mouse_handler_params[0] = frame.copy()
@@ -1534,8 +1602,9 @@ class GameScanner:
                     dw = int(display_frame.shape[1] * self._display_scale)
                     dh = int(display_frame.shape[0] * self._display_scale)
                     display_frame = cv2.resize(display_frame, (dw, dh))
-                cv2.imshow(settings.WINDOW_NAME, display_frame)
-                self.metrics.render()
+                if not settings.HEADLESS:
+                    cv2.imshow(settings.WINDOW_NAME, display_frame)
+                    self.metrics.render()
 
             # Кадр → MJPEG стрим (encode после resize чтобы слать уменьшенный кадр)
             with (p.measure('mjpeg') if p else nullcontext()):
@@ -1560,6 +1629,14 @@ class GameScanner:
                     settings.CV2_SHOW_OVERLAY = not settings.CV2_SHOW_OVERLAY
                     state = "видна" if settings.CV2_SHOW_OVERLAY else "скрыта"
                     self._log(f"Панель команд cv2: {state}")
+                elif cmd == "sim_step":
+                    self._simulate_step()
+                elif cmd == "sim_auto":
+                    self._simulate_auto()
+                elif cmd == "sim_toggle":
+                    settings.SIMULATION_ENABLED = not settings.SIMULATION_ENABLED
+                    self._log(f"Симуляция (форс ходов): {'вкл' if settings.SIMULATION_ENABLED else 'выкл'}")
+                    self._sync_http_game_state()
 
             # HTTP админ-команды (удаление фишки / игрока, калибровка)
             for acmd in self.http_server.drain_admin():
@@ -1630,8 +1707,12 @@ class GameScanner:
                     self._sync_chips_http()
                     self._sync_http_game_state()
 
-            # Обработка клавиатуры и кликов по кнопкам
-            key = cv2.waitKey(1) & 0xFF
+            # Обработка клавиатуры и кликов по кнопкам (в headless окна нет → клавиатуры нет)
+            if settings.HEADLESS:
+                time.sleep(0.01)
+                key = 255
+            else:
+                key = cv2.waitKey(1) & 0xFF
             if self._pending_key is not None:
                 key = self._pending_key
                 self._pending_key = None
@@ -1644,8 +1725,9 @@ class GameScanner:
         
         # Очистка (финальный лог в shutdown())
         self.camera.release()
-        cv2.destroyAllWindows()
-    
+        if not settings.HEADLESS:
+            cv2.destroyAllWindows()
+
     def shutdown(self):
         """Корректное завершение работы системы"""
         # Сводка качества детекции за сессию (раздел 4.2)

@@ -5,7 +5,7 @@ from http.server import ThreadingHTTPServer, BaseHTTPRequestHandler
 from typing import Optional
 
 from server._state import _State
-from server._pages import ADMIN_HTML, JOIN_HTML, GAME_HTML, RESULT_HTML
+from server._pages import ADMIN_HTML, JOIN_HTML, GAME_HTML, RESULT_HTML, PILOT_HTML
 from server import _net
 from config import settings
 from config import messages as _msg_module
@@ -22,6 +22,13 @@ class GameEventHandler(BaseHTTPRequestHandler):
             self._send(GAME_HTML, "text/html; charset=utf-8")
         elif self.path == "/result":
             self._send(RESULT_HTML, "text/html; charset=utf-8")
+        elif self.path == "/pilot":
+            self._send(PILOT_HTML, "text/html; charset=utf-8")
+        elif self.path == "/video":
+            self._video_index()
+        elif self.path.startswith("/video/file/"):
+            from urllib.parse import unquote
+            self._serve_video(unquote(self.path[len("/video/file/"):]))
         elif self.path == "/stream":
             self._mjpeg_stream()
         elif self.path == "/api/chips":
@@ -69,6 +76,15 @@ class GameEventHandler(BaseHTTPRequestHandler):
         elif self.path == "/api/game/overlay":
             _State.command_queue.put("overlay")
             self._json({"status": "queued"})
+        elif self.path == "/api/game/sim_step":
+            _State.command_queue.put("sim_step")
+            self._json({"status": "queued"})
+        elif self.path == "/api/game/sim_auto":
+            _State.command_queue.put("sim_auto")
+            self._json({"status": "queued"})
+        elif self.path == "/api/game/sim_toggle":
+            _State.command_queue.put("sim_toggle")
+            self._json({"status": "queued"})
         elif self.path == "/api/game/path":
             self._handle_set_path()
         elif self.path == "/api/game/endgame":
@@ -103,6 +119,95 @@ class GameEventHandler(BaseHTTPRequestHandler):
         self.end_headers()
 
     # ---- helpers ----
+
+    def _video_index(self):
+        """Страница /video — список записей (.mp4 из settings.VIDEO_DIR), плеер с перемоткой."""
+        import os, html
+        from urllib.parse import quote
+        d = settings.VIDEO_DIR
+        # whitelist: показываем только ролики, перечисленные в config/video_titles.json
+        # (filename → заголовок) и реально лежащие в VIDEO_DIR. Нет в json → не показываем.
+        titles = {}
+        tpath = os.path.join("config", "video_titles.json")
+        if os.path.isfile(tpath):
+            try:
+                with open(tpath, encoding="utf-8") as tf:
+                    titles = json.load(tf)
+            except Exception:
+                titles = {}
+        # preload="none" → видео грузится только при нажатии play (не все сразу)
+        items = "".join(
+            f'<figure><figcaption>{html.escape(str(title))}</figcaption>'
+            f'<video controls preload="none" src="/video/file/{quote(fname)}"></video></figure>'
+            for fname, title in titles.items()
+            if os.path.isfile(os.path.join(d, fname))
+        ) or "<p>Видео не найдено. Добавьте записи в config/video_titles.json (они должны лежать в VIDEO_DIR).</p>"
+        page = (
+            "<!DOCTYPE html><html lang=ru><head><meta charset=utf-8>"
+            "<meta name=viewport content='width=device-width,initial-scale=1'><title>Записи игр</title>"
+            "<style>body{margin:0;background:#16181d;color:#e6e6e6;font-family:system-ui,sans-serif}"
+            "header{padding:10px 16px;background:#0f1115;font-weight:600}"
+            ".grid{display:flex;flex-direction:column;gap:16px;padding:16px;align-items:flex-start}"
+            "figure{margin:0;width:100%;max-width:760px}video{width:100%;border-radius:8px;background:#000}"
+            "figcaption{margin-bottom:6px;font-family:monospace}</style></head>"
+            f"<body><header>Записи игр</header><div class=grid>{items}</div></body></html>"
+        )
+        self._send(page.encode("utf-8"), "text/html; charset=utf-8")
+
+    def _serve_video(self, name):
+        """Отдача .mp4 из settings.VIDEO_DIR с поддержкой HTTP Range (прогрессив + перемотка)."""
+        import os
+        safe = os.path.basename(name)
+        path = os.path.join(settings.VIDEO_DIR, safe)
+        if not safe.lower().endswith(".mp4") or not os.path.isfile(path):
+            self._json({"error": "not found"}, 404)
+            return
+        # whitelist: отдаём только то, что перечислено в config/video_titles.json
+        try:
+            with open(os.path.join("config", "video_titles.json"), encoding="utf-8") as tf:
+                allowed = json.load(tf)
+        except Exception:
+            allowed = {}
+        if safe not in allowed:
+            self._json({"error": "not found"}, 404)
+            return
+        size = os.path.getsize(path)
+        rng = self.headers.get("Range", "")
+        start, end = 0, size - 1
+        partial = False
+        if rng.startswith("bytes="):
+            partial = True
+            s, _, e = rng[6:].partition("-")
+            try:
+                start = int(s) if s else 0
+                end = int(e) if e else size - 1
+            except ValueError:
+                start, end = 0, size - 1
+            start = max(0, start)
+            end = min(end, size - 1)
+            if start > end:
+                start, end = 0, size - 1
+        length = end - start + 1
+        self.send_response(206 if partial else 200)
+        self.send_header("Content-Type", "video/mp4")
+        self.send_header("Accept-Ranges", "bytes")
+        if partial:
+            self.send_header("Content-Range", f"bytes {start}-{end}/{size}")
+        self.send_header("Content-Length", str(length))
+        self._cors()
+        self.end_headers()
+        with open(path, "rb") as f:
+            f.seek(start)
+            remaining = length
+            while remaining > 0:
+                chunk = f.read(min(65536, remaining))
+                if not chunk:
+                    break
+                try:
+                    self.wfile.write(chunk)
+                except (BrokenPipeError, ConnectionResetError):
+                    break
+                remaining -= len(chunk)
 
     def _send_qr(self):
         """QR-код со ссылкой на /join (для подключения игроков и слайдов презентации)."""
